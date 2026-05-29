@@ -17,6 +17,49 @@ def get_device() -> str:
     return _get_device()
 
 
+def ensure_model_downloaded(model_dir: str) -> str:
+    """
+    确保模型已下载。若本地不存在，自动从 ModelScope/HuggingFace 下载。
+    ModelScope 云环境优先使用 modelscope 库。
+    """
+    if os.path.exists(model_dir):
+        return model_dir
+
+    print(f"模型目录不存在: {model_dir}")
+    print("尝试自动下载 Qwen2.5-0.5B-Instruct ...")
+
+    cache_dir = os.path.dirname(os.path.dirname(model_dir))
+
+    try:
+        from modelscope import snapshot_download
+        downloaded = snapshot_download(
+            'Qwen/Qwen2.5-0.5B-Instruct',
+            cache_dir=cache_dir,
+        )
+        print(f"模型已下载到: {downloaded}")
+        return downloaded
+    except ImportError:
+        pass
+    except Exception as e:
+        print(f"ModelScope 下载失败: {e}")
+
+    try:
+        from huggingface_hub import snapshot_download
+        downloaded = snapshot_download(
+            'Qwen/Qwen2.5-0.5B-Instruct',
+            cache_dir=cache_dir,
+        )
+        print(f"模型已下载到: {downloaded}")
+        return downloaded
+    except ImportError:
+        pass
+    except Exception as e:
+        print(f"HuggingFace 下载失败: {e}")
+
+    print("自动下载失败，请手动下载模型到 models/ 目录")
+    return model_dir
+
+
 def get_paths() -> dict:
     """
     返回所有路径配置，自动适配运行环境。
@@ -50,6 +93,8 @@ def get_paths() -> dict:
     train_cot = os.path.join(data_dir, 'train_cot.json')
     if not os.path.exists(train_cot):
         train_cot = os.path.join(data_dir, 'train_cot_original.json')
+
+    model_dir = ensure_model_downloaded(model_dir)
 
     return {
         'base_model': model_dir,
