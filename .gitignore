@@ -3,6 +3,7 @@ models/
 *.bin
 *.pth
 *.onnx
+*.pt
 outputs/
 __pycache__/
 *.pyc
@@ -12,11 +13,6 @@ dist/
 build/
 .env
 Math_Solver/
-data/train.json
-data/train_preference_final_merged.json
 data/submit.csv
-workspace/data/train.json
-workspace/data/train_cot_original.json
-workspace/data/train_preference.json
 workspace/data/submit.csv
 workspace/err.txt
