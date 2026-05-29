@@ -1,0 +1,16 @@
+# 基础依赖
+torch>=2.0.0
+transformers>=4.35.0
+peft>=0.6.0
+accelerate>=0.24.0
+
+# 模型下载
+modelscope>=1.10.0
+
+# 数据处理
+tqdm>=4.65.0
+numpy>=1.24.0
+
+# 其他
+sentencepiece>=0.1.99
+protobuf>=3.20.0

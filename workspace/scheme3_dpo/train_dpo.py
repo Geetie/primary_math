@@ -1,0 +1,308 @@
+"""
+方案3：DPO（直接策略优化）对齐训练
+基于方案2的SFT模型，使用偏好数据进行DPO训练
+完整实现，使用 HuggingFace trl 库的 DPOTrainer
+
+参考: https://github.com/ShawhinT/YouTube-Blog/tree/main/LLMs/dpo
+数据格式严格遵循 DPOTrainer 要求：
+  - prompt: List[Dict] 消息列表（DPOTrainer自动apply_chat_template）
+  - chosen: str assistant回复（含<|im_start|>assistant前缀）
+  - rejected: str assistant回复（含<|im_start|>assistant前缀）
+"""
+
+import os
+import sys
+import re
+from typing import Dict, Any, Optional, List
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from peft import PeftModel
+
+from utils.common import load_json, save_json, print_config, get_device
+
+
+# ============================================================
+# DPO 数据格式转换
+# ============================================================
+
+def _ensure_answer_suffix(text: str, answer: str) -> str:
+    """
+    确保文本末尾包含"答案：xxx"且不重复。
+    如果已有"答案："行，检查是否与answer一致，不一致则替换。
+    """
+    # 检查是否已有"答案："行
+    match = re.search(r'答案[：:]\s*\S+\s*$', text.strip())
+    if match:
+        # 已有答案行，检查是否正确
+        existing_ans = match.group().split('：')[-1].split(':')[-1].strip()
+        if existing_ans == str(answer).strip():
+            return text  # 已正确，不重复
+        else:
+            # 答案不一致，替换末尾
+            return re.sub(r'答案[：:]\s*\S+\s*$', f'答案：{answer}', text.strip())
+    else:
+        # 没有答案行，追加
+        return f"{text.strip()}\n答案：{answer}"
+
+
+def prepare_dpo_dataset(preference_data_path: str, tokenizer, max_length: int = 512):
+    """
+    将偏好数据转换为 DPOTrainer 要求的格式（trl >= 0.12.0 conversational格式）。
+
+    输入格式（train_preference.json）:
+        {"id": "0", "question": "...", "answer": "85",
+         "chosen": "正确COT步骤", "rejected": "错误COT步骤"}
+
+    输出格式（trl DPOTrainer conversational格式）:
+        {
+            "prompt": [{"role": "system", ...}, {"role": "user", ...}],
+            "chosen": [{"role": "assistant", "content": "正确COT步骤"}],
+            "rejected": [{"role": "assistant", "content": "错误COT步骤"}],
+        }
+    """
+    from datasets import Dataset
+
+    pref_data = load_json(preference_data_path)
+    dpo_dataset = []
+
+    for item in pref_data:
+        question = item['question']
+        if isinstance(question, list):
+            question = "".join(question)
+        chosen_text = item['chosen']
+        if isinstance(chosen_text, list):
+            chosen_text = "".join(chosen_text)
+        rejected_text = item['rejected']
+        if isinstance(rejected_text, list):
+            rejected_text = "".join(rejected_text)
+        answer = str(item['answer'])
+
+        prompt = [
+            {"role": "system", "content": "解答小学数学题，按步骤解答，最后用\"答案：数字\"给出结果。"},
+            {"role": "user", "content": question},
+        ]
+
+        chosen = _ensure_answer_suffix(chosen_text, answer)
+
+        # rejected: 错误COT + 错误答案（去重处理）
+        err_match = re.search(r'答案[：:]\s*(\S+)', rejected_text)
+        err_ans = err_match.group(1) if err_match else "0"
+        rejected = _ensure_answer_suffix(rejected_text, err_ans)
+
+        dpo_dataset.append({
+            "prompt": prompt,
+            "chosen": [{"role": "assistant", "content": chosen}],
+            "rejected": [{"role": "assistant", "content": rejected}],
+        })
+
+    print(f"DPO数据集: {len(dpo_dataset)} 条")
+    return Dataset.from_list(dpo_dataset)
+
+
+# ============================================================
+# DPO Trainer（基于 HuggingFace DPOTrainer）
+# ============================================================
+
+def train_dpo(
+    sft_model_path: str,
+    sft_peft_path: str,
+    pref_data_path: str,
+    output_dir: str,
+    device: str = None,
+    batch_size: int = 4,
+    gradient_accumulation_steps: int = 4,
+    num_epochs: int = 3,
+    learning_rate: float = 5e-7,
+    max_length: int = 512,
+    beta: float = 0.1,
+    max_steps: int = -1,
+):
+    """
+    DPO训练流程，使用 HuggingFace trl 库的 DPOTrainer。
+
+    Args:
+        sft_model_path: SFT基础模型路径
+        sft_peft_path: SFT训练后的PEFT权重路径
+        pref_data_path: 偏好数据路径
+        output_dir: 输出目录
+        batch_size: 批次大小
+        gradient_accumulation_steps: 梯度累积步数
+        num_epochs: 训练轮数
+        learning_rate: 学习率
+        max_length: 最大序列长度
+        beta: DPO beta参数（KL散度系数）
+    """
+    try:
+        from trl import DPOConfig, DPOTrainer
+    except ImportError:
+        print("⚠️ trl 库未安装，请运行: pip install trl")
+        print("DPO训练跳过...")
+        return None, None, None
+
+    if device is None:
+        device = get_device()
+    print(f"设备: {device}")
+
+    print_config({
+        "sft_peft_path": sft_peft_path,
+        "pref_data_path": pref_data_path,
+        "output_dir": output_dir,
+        "batch_size": batch_size,
+        "num_epochs": num_epochs,
+        "learning_rate": learning_rate,
+        "beta": beta,
+    })
+
+    # ---- 加载模型 ----
+    print("加载模型...")
+    tokenizer = AutoTokenizer.from_pretrained(
+        sft_model_path, use_fast=False, trust_remote_code=True
+    )
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    base_model = AutoModelForCausalLM.from_pretrained(
+        sft_model_path,
+        device_map=device if device != "cpu" else None,
+        torch_dtype=torch.bfloat16 if device != "cpu" else torch.float32,
+        trust_remote_code=True,
+    )
+
+    if sft_peft_path and os.path.exists(sft_peft_path):
+        is_peft = os.path.exists(os.path.join(sft_peft_path, "adapter_config.json"))
+        if is_peft:
+            model = PeftModel.from_pretrained(base_model, sft_peft_path)
+            print(f"已加载PEFT权重: {sft_peft_path}")
+            print("合并PEFT权重...")
+            model = model.merge_and_unload()
+        else:
+            del base_model
+            model = AutoModelForCausalLM.from_pretrained(
+                sft_peft_path,
+                device_map=device if device != "cpu" else None,
+                torch_dtype=torch.bfloat16 if device != "cpu" else torch.float32,
+                trust_remote_code=True,
+            )
+            print(f"已加载完整模型: {sft_peft_path}")
+    else:
+        model = base_model
+
+    if device == "cpu":
+        model = model.to(device)
+
+    model.enable_input_require_grads()
+
+    # ---- 准备DPO数据 ----
+    print("准备DPO数据...")
+    dpo_data = prepare_dpo_dataset(pref_data_path, tokenizer)
+
+    # ---- 检查断点 ----
+    has_checkpoint = False
+    if os.path.exists(output_dir):
+        has_checkpoint = any(
+            f.startswith("checkpoint-")
+            for f in os.listdir(output_dir)
+            if os.path.isdir(os.path.join(output_dir, f))
+        )
+
+    # ---- 创建DPOConfig ----
+    print("创建DPO Trainer...")
+    dpo_config_kwargs = dict(
+        output_dir=output_dir,
+        per_device_train_batch_size=batch_size,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        gradient_checkpointing=True,
+        logging_steps=10,
+        num_train_epochs=num_epochs,
+        save_strategy="epoch",
+        learning_rate=learning_rate,
+        warmup_ratio=0.1,
+        lr_scheduler_type="cosine",
+        beta=beta,
+        loss_type="sigmoid",
+        label_smoothing=0.0,
+        report_to="none",
+        fp16=device != "cpu",
+        bf16=False,
+        remove_unused_columns=False,
+    )
+    if max_steps > 0:
+        dpo_config_kwargs["max_steps"] = max_steps
+
+    training_args = DPOConfig(**dpo_config_kwargs)
+
+    # ---- 创建DPOTrainer ----
+    import trl
+    trl_version = tuple(int(x) for x in trl.__version__.split('.')[:2])
+    trainer_kwargs = dict(
+        model=model,
+        args=training_args,
+        train_dataset=dpo_data,
+    )
+    if trl_version >= (0, 12):
+        trainer_kwargs["processing_class"] = tokenizer
+    else:
+        trainer_kwargs["tokenizer"] = tokenizer
+
+    dpo_trainer = DPOTrainer(**trainer_kwargs)
+
+    # ---- 开始训练 ----
+    print("开始DPO训练...")
+    dpo_trainer.train(resume_from_checkpoint=has_checkpoint)
+
+    # ---- 保存模型 ----
+    final_path = os.path.join(output_dir, "final")
+    dpo_trainer.save_model(final_path)
+    print(f"DPO模型已保存: {final_path}")
+
+    return dpo_trainer, model, tokenizer
+
+
+def run_dpo_from_notebook(
+    sft_model_path: str,
+    sft_peft_path: str,
+    pref_data_path: str,
+    output_dir: str,
+    device: str = "cuda",
+):
+    """从Notebook调用的便捷函数"""
+    os.makedirs(output_dir, exist_ok=True)
+
+    return train_dpo(
+        sft_model_path=sft_model_path,
+        sft_peft_path=sft_peft_path,
+        pref_data_path=pref_data_path,
+        output_dir=output_dir,
+        device=device,
+        batch_size=4,
+        gradient_accumulation_steps=4,
+        num_epochs=3,
+        learning_rate=5e-7,
+        beta=0.1,
+    )
+
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--sft_model_path", type=str,
+                       default="../models/Qwen2.5-0.5B-Instruct")
+    parser.add_argument("--sft_peft_path", type=str,
+                       default="../outputs/scheme2_cot/final")
+    parser.add_argument("--pref_data_path", type=str,
+                       default="../data/train_preference.json")
+    parser.add_argument("--output_dir", type=str,
+                       default="../outputs/scheme3_dpo")
+    parser.add_argument("--device", type=str, default=None)
+    args = parser.parse_args()
+
+    train_dpo(
+        sft_model_path=args.sft_model_path,
+        sft_peft_path=args.sft_peft_path,
+        pref_data_path=args.pref_data_path,
+        output_dir=args.output_dir,
+        device=args.device,
+    )
