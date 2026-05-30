@@ -178,6 +178,7 @@ def train_dpo(
             print(f"已加载PEFT权重: {sft_peft_path}")
             print("合并PEFT权重...")
             model = model.merge_and_unload()
+            del base_model
         else:
             del base_model
             model = AutoModelForCausalLM.from_pretrained(
@@ -200,13 +201,13 @@ def train_dpo(
     dpo_data = prepare_dpo_dataset(pref_data_path, tokenizer)
 
     # ---- 检查断点 ----
-    has_checkpoint = False
+    checkpoint = None
     if os.path.exists(output_dir):
-        has_checkpoint = any(
-            f.startswith("checkpoint-")
-            for f in os.listdir(output_dir)
-            if os.path.isdir(os.path.join(output_dir, f))
-        )
+        checkpoints = [f for f in os.listdir(output_dir) if f.startswith("checkpoint-")]
+        if checkpoints:
+            latest = sorted(checkpoints, key=lambda x: int(x.split("-")[1]))[-1]
+            checkpoint = os.path.join(output_dir, latest)
+            print(f"发现checkpoint: {checkpoint}")
 
     # ---- 创建DPOConfig ----
     print("创建DPO Trainer...")
@@ -224,10 +225,13 @@ def train_dpo(
         beta=beta,
         loss_type="sigmoid",
         label_smoothing=0.0,
+        max_length=max_length,
         report_to="none",
-        fp16=device != "cpu",
-        bf16=False,
+        fp16=False,
+        bf16=device != "cpu",
         remove_unused_columns=False,
+        generate_during_eval=False,
+        dataloader_num_workers=2,
     )
     if max_steps > 0:
         dpo_config_kwargs["max_steps"] = max_steps
@@ -251,7 +255,7 @@ def train_dpo(
 
     # ---- 开始训练 ----
     print("开始DPO训练...")
-    dpo_trainer.train(resume_from_checkpoint=has_checkpoint)
+    dpo_trainer.train(resume_from_checkpoint=checkpoint)
 
     # ---- 保存模型 ----
     final_path = os.path.join(output_dir, "final")
@@ -277,8 +281,8 @@ def run_dpo_from_notebook(
         pref_data_path=pref_data_path,
         output_dir=output_dir,
         device=device,
-        batch_size=4,
-        gradient_accumulation_steps=4,
+        batch_size=2,
+        gradient_accumulation_steps=8,
         num_epochs=3,
         learning_rate=5e-7,
         beta=0.1,

@@ -11,6 +11,7 @@
 
 import os
 import sys
+import re
 from typing import Dict, Any, Optional, List
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -46,50 +47,45 @@ def process_sft_sample(tokenizer, example: Dict, max_length: int = 512) -> Dict:
     """
     处理单条 SFT 样本。
 
+    支持两种数据格式：
+    1. {question, cot, answer} — 传统COT格式
+    2. {question, chosen, answer} — 偏好数据格式（chosen即正确COT）
+
     使用 Qwen 官方 chat template 构建输入输出：
       - 输入部分（system + user）→ labels 全部设为 -100（不计算 loss）
       - 输出部分（assistant）→ 正常计算 loss
-
-    Args:
-        tokenizer: Qwen tokenizer
-        example: 包含 question, cot, answer 的字典
-        max_length: 最大序列长度
-    Returns:
-        {input_ids, attention_mask, labels}
     """
     question = example["question"]
     if isinstance(question, list):
         question = "".join(question)
-    cot = example.get("cot", "")
+
+    cot = example.get("cot", "") or example.get("chosen", "")
     if isinstance(cot, list):
         cot = "".join(cot)
+
     answer = str(example["answer"])
     instruction = example.get("instruction", "解答这道小学数学题。")
     if isinstance(instruction, list):
         instruction = "".join(instruction)
 
-    # 使用 Qwen 官方 chat template 构建 messages
+    assistant_content = f"{cot}\n答案：{answer}" if not re.search(r'答案[：:]', cot) else cot
+
     messages = [
         {"role": "system", "content": f"{instruction} 请按步骤解答，最后用\"答案：数字\"给出结果。"},
         {"role": "user", "content": question},
-        {"role": "assistant", "content": f"{cot}\n答案：{answer}"},
+        {"role": "assistant", "content": assistant_content},
     ]
 
-    # 用 chat_template 拼接，获取完整 token 序列
     text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
     all_ids = tokenizer(text, add_special_tokens=False)["input_ids"]
 
-    # 找到 assistant 回复的起始位置
-    # 重建 assistant 之前的部分来计算长度
-    prefix_messages = messages[:2]  # system + user
+    prefix_messages = messages[:2]
     prefix_text = tokenizer.apply_chat_template(prefix_messages, tokenize=False, add_generation_prompt=True)
     prefix_ids = tokenizer(prefix_text, add_special_tokens=False)["input_ids"]
 
-    # 构建 labels：prefix 部分 -100，assistant 部分正常
     prefix_len = len(prefix_ids)
     labels = [-100] * prefix_len + all_ids[prefix_len:]
 
-    # 截断
     if len(all_ids) > max_length:
         all_ids = all_ids[:max_length]
         labels = labels[:max_length]
@@ -240,10 +236,9 @@ class COTTrainer:
             gradient_checkpointing=True,
             report_to="none",
             remove_unused_columns=False,
-            fp16=self.device != "cpu",
-            bf16=False,
-            dataloader_num_workers=0,
-            resume_from_checkpoint=has_checkpoint,
+            fp16=False,
+            bf16=self.device != "cpu",
+            dataloader_num_workers=2,
         )
 
         self.trainer = Trainer(

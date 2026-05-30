@@ -1,19 +1,18 @@
 """
-方案2：COT数据生成 + 数据增强（审查意见优化版）
+方案2：COT数据生成 + 数据增强
 
-数据逻辑（两阶段）：
-  阶段1 - 原始12k数据：必须调用LongCat API生成真实COT
-    → train_cot.json（正确COT）
-    → train_preference.json（正确COT + 错误COT）
+⚠️ 已废弃：完整COT数据已就绪（train_preference_final_merged.json，11955条）
+  - chosen 字段即正确COT，无需再调API生成
+  - pipeline_config 会自动从偏好数据派生SFT数据
+  - 本文件仅保留数字替换增强功能供参考
 
-  阶段2 - 增强数据（数字替换，12k→36k）：
-    → 绝对不调用API！
-    → 复用原始COT结构 → 替换题目/步骤里的数字 → 代码自动算新答案
-    → 省API额度、速度快、逻辑一致
+数据逻辑（已简化）：
+  主数据源：train_preference_final_merged.json
+    → SFT: chosen 字段作为 cot（pipeline_config 自动派生 train_cot.json）
+    → DPO: chosen/rejected 直接使用
+    → GRPO: question/answer 直接使用
 
-最终输出：
-  - data/train_cot.json: 原始12k + 增强24k = 36k SFT数据
-  - data/train_preference.json: 原始12k的chosen/rejected成对数据
+如需数字替换增强（可选），可调用 augment_data_with_number_replacement()
 """
 
 import os

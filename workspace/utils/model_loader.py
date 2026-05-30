@@ -136,5 +136,3 @@ def predict(messages, model, tokenizer, max_new_tokens: int = 512, device: str =
     return response.strip()
 
 
-# 导入torch用于类型提示
-import torch

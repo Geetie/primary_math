@@ -99,7 +99,7 @@ def _gpu_batch_generate(model, tokenizer, prompts, max_new_tokens, batch_size):
     for i in tqdm(range(0, len(prompts), batch_size), desc="批量推理"):
         batch = prompts[i:i + batch_size]
         inputs = tokenizer(batch, return_tensors="pt", padding=True, truncation=True,
-                           max_length=512).to(model.device)
+                           max_length=512, padding_side="left").to(model.device)
 
         with torch.no_grad():
             generated = model.generate(
@@ -110,9 +110,9 @@ def _gpu_batch_generate(model, tokenizer, prompts, max_new_tokens, batch_size):
                 eos_token_id=tokenizer.eos_token_id,
             )
 
-        # 裁掉输入部分
         for j, g in enumerate(generated):
-            out = g[inputs["input_ids"].shape[1]:]
+            input_len = inputs["attention_mask"][j].sum().item()
+            out = g[input_len:]
             all_responses.append(tokenizer.decode(out, skip_special_tokens=True).strip())
 
     return all_responses

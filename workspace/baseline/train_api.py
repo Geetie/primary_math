@@ -146,11 +146,14 @@ class BaselineTrainer:
     def create_trainer(self, train_dataset: List[Dict]):
         """创建 Trainer"""
         output_dir = self.config["output_dir"]
-        has_checkpoint = (
-            os.path.exists(output_dir) and
-            any(f.startswith("checkpoint-") for f in os.listdir(output_dir)
-                if os.path.isdir(os.path.join(output_dir, f)))
-        )
+        has_checkpoint = False
+        if os.path.exists(output_dir):
+            has_checkpoint = any(
+                f.startswith("checkpoint-")
+                for f in os.listdir(output_dir)
+                if os.path.isdir(os.path.join(output_dir, f))
+            )
+
         training_args = TrainingArguments(
             output_dir=output_dir,
             per_device_train_batch_size=self.config["batch_size"],
@@ -166,10 +169,9 @@ class BaselineTrainer:
             gradient_checkpointing=True,
             report_to="none",
             remove_unused_columns=False,
-            fp16=self.device != "cpu",
-            bf16=False,
-            dataloader_num_workers=0,
-            resume_from_checkpoint=has_checkpoint,
+            fp16=False,
+            bf16=self.device != "cpu",
+            dataloader_num_workers=2,
         )
         self.trainer = Trainer(
             model=self.model,

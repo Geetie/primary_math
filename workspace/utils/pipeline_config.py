@@ -3,10 +3,16 @@
 - GPU/CPU 配置分离
 - 路径自动适配（Kaggle / ModelScope / 本地）
 - Notebook 只需导入配置，无需手写参数
+
+数据源：train_preference_final_merged.json（完整11955条COT偏好数据）
+  - SFT: 从 chosen 字段提取COT
+  - DPO: 直接使用 chosen/rejected
+  - GRPO: 使用 question/answer
 """
 
 import os
 import sys
+import json
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -18,10 +24,6 @@ def get_device() -> str:
 
 
 def ensure_model_downloaded(model_dir: str) -> str:
-    """
-    确保模型已下载。若本地不存在，自动从 ModelScope/HuggingFace 下载。
-    ModelScope 云环境优先使用 modelscope 库。
-    """
     if os.path.exists(model_dir):
         return model_dir
 
@@ -60,20 +62,59 @@ def ensure_model_downloaded(model_dir: str) -> str:
     return model_dir
 
 
-def get_paths() -> dict:
-    """
-    返回所有路径配置，自动适配运行环境。
+def _find_preference_data(data_dir: str) -> str:
+    candidates = [
+        os.path.join(data_dir, 'train_preference_final_merged.json'),
+        os.path.join(data_dir, 'train_preference.json'),
+    ]
+    for c in candidates:
+        if os.path.exists(c):
+            return c
+    return candidates[0]
 
-    Returns:
-        {
-            'base_model': str,
-            'data_dir': str,
-            'output_dir': str,
-            'train_cot': str,
-            'train_preference': str,
-            'train_cot_original': str,
-        }
+
+def _ensure_sft_data_from_preference(pref_path: str) -> str:
     """
+    从 train_preference_final_merged.json 派生 SFT 训练数据。
+    将 chosen 字段转为 cot 字段，保存为 train_cot.json。
+    如果 train_cot.json 已存在且来源一致，则跳过。
+    """
+    sft_path = pref_path.replace('train_preference_final_merged.json', 'train_cot.json').replace('train_preference.json', 'train_cot.json')
+
+    if os.path.exists(sft_path):
+        existing = json.load(open(sft_path, 'r', encoding='utf-8'))
+        if len(existing) > 0 and existing[0].get('cot'):
+            return sft_path
+
+    if not os.path.exists(pref_path):
+        return sft_path
+
+    print(f"从偏好数据派生SFT数据: {pref_path} → {sft_path}")
+    pref_data = json.load(open(pref_path, 'r', encoding='utf-8'))
+
+    sft_data = []
+    for item in pref_data:
+        cot_text = item.get('chosen', '')
+        if isinstance(cot_text, list):
+            cot_text = "".join(cot_text)
+        if not cot_text.strip():
+            continue
+        sft_data.append({
+            "id": item.get("id", ""),
+            "question": item["question"],
+            "answer": str(item["answer"]),
+            "cot": cot_text,
+            "instruction": item.get("instruction", "解答这道小学数学题。"),
+        })
+
+    os.makedirs(os.path.dirname(sft_path) or '.', exist_ok=True)
+    json.dump(sft_data, open(sft_path, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
+    print(f"SFT数据已生成: {len(sft_data)} 条 → {sft_path}")
+
+    return sft_path
+
+
+def get_paths() -> dict:
     if os.path.exists('/kaggle'):
         root = '/kaggle/working'
     elif os.path.exists('/mnt/workspace'):
@@ -83,16 +124,24 @@ def get_paths() -> dict:
 
     data_dir = os.path.join(root, 'data')
     output_dir = os.path.join(root, 'outputs')
-    model_dir = os.path.join(os.path.dirname(root), 'models', 'qwen', 'Qwen2___5-0___5B-Instruct')
 
-    if not os.path.exists(model_dir):
-        alt = os.path.join(root, 'models', 'qwen', 'Qwen2___5-0___5B-Instruct')
-        if os.path.exists(alt):
-            model_dir = alt
+    model_dir = None
+    candidates = [
+        os.path.join(os.path.dirname(root), 'models', 'qwen', 'Qwen2___5-0___5B-Instruct'),
+        os.path.join(root, 'models', 'qwen', 'Qwen2___5-0___5B-Instruct'),
+        os.path.join(os.path.dirname(root), 'models', 'Qwen2.5-0.5B-Instruct'),
+        os.path.join(root, 'models', 'Qwen2.5-0.5B-Instruct'),
+    ]
+    for c in candidates:
+        if os.path.exists(c):
+            model_dir = c
+            break
 
-    train_cot = os.path.join(data_dir, 'train_cot.json')
-    if not os.path.exists(train_cot):
-        train_cot = os.path.join(data_dir, 'train_cot_original.json')
+    if model_dir is None:
+        model_dir = candidates[0]
+
+    train_preference = _find_preference_data(data_dir)
+    train_cot = _ensure_sft_data_from_preference(train_preference)
 
     model_dir = ensure_model_downloaded(model_dir)
 
@@ -101,19 +150,12 @@ def get_paths() -> dict:
         'data_dir': data_dir,
         'output_dir': output_dir,
         'train_cot': train_cot,
-        'train_preference': os.path.join(data_dir, 'train_preference.json'),
+        'train_preference': train_preference,
         'train_cot_original': os.path.join(data_dir, 'train_cot_original.json'),
     }
 
 
 def get_sft_config(device: str = None, paths: dict = None) -> dict:
-    """
-    返回方案2 SFT训练配置，GPU/CPU自动分离。
-
-    Args:
-        device: 设备类型，None则自动检测
-        paths: 路径配置，None则自动获取
-    """
     if device is None:
         device = get_device()
     if paths is None:
@@ -139,8 +181,8 @@ def get_sft_config(device: str = None, paths: dict = None) -> dict:
     if is_gpu:
         config.update({
             'max_length': 512,
-            'batch_size': 8,
-            'gradient_accumulation_steps': 2,
+            'batch_size': 4,
+            'gradient_accumulation_steps': 4,
             'num_epochs': 3,
         })
     else:
@@ -156,12 +198,6 @@ def get_sft_config(device: str = None, paths: dict = None) -> dict:
 
 
 def get_dpo_config(device: str = None, paths: dict = None) -> dict:
-    """
-    返回方案3 DPO训练配置，GPU/CPU自动分离。
-
-    Returns:
-        train_dpo() 的关键字参数字典
-    """
     if device is None:
         device = get_device()
     if paths is None:
@@ -184,7 +220,7 @@ def get_dpo_config(device: str = None, paths: dict = None) -> dict:
     if is_gpu:
         config.update({
             'batch_size': 2,
-            'gradient_accumulation_steps': 4,
+            'gradient_accumulation_steps': 8,
             'num_epochs': 3,
         })
     else:
@@ -199,12 +235,6 @@ def get_dpo_config(device: str = None, paths: dict = None) -> dict:
 
 
 def get_grpo_config(device: str = None, paths: dict = None) -> dict:
-    """
-    返回方案4 GRPO训练配置，GPU/CPU自动分离。
-
-    Returns:
-        train_grpo() 的关键字参数字典
-    """
     if device is None:
         device = get_device()
     if paths is None:
@@ -233,12 +263,13 @@ def get_grpo_config(device: str = None, paths: dict = None) -> dict:
     if is_gpu:
         config.update({
             'group_size': 4,
-            'num_iterations': 50,
+            'num_iterations': 3,
+            'max_new_tokens': 128,
         })
     else:
         config.update({
             'group_size': 2,
-            'num_iterations': 2,
+            'num_iterations': 1,
             'max_new_tokens': 64,
             'max_samples': 3,
         })
