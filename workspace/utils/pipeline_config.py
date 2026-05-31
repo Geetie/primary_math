@@ -201,9 +201,9 @@ def get_sft_config(device: str = None, paths: dict = None) -> dict:
         _enable_tf32()
         _set_seed(42)
         config.update({
-            'max_length': 384,
-            'batch_size': 16,
-            'gradient_accumulation_steps': 4,
+            'max_length': 320,
+            'batch_size': 8,
+            'gradient_accumulation_steps': 8,
             'num_epochs': 3,
             'dataloader_num_workers': 2,
             'optim': 'adamw_torch_fused',
