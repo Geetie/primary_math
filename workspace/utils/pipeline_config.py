@@ -192,8 +192,8 @@ def get_sft_config(device: str = None, paths: dict = None) -> dict:
         'warmup_ratio': 0.1,
         'weight_decay': 0.01,
         'lr_scheduler_type': 'cosine',
-        'save_steps': 500,
-        'logging_steps': 10,
+        'save_steps': 2000,
+        'logging_steps': 50,
         'seed': 42,
     }
 
@@ -201,11 +201,11 @@ def get_sft_config(device: str = None, paths: dict = None) -> dict:
         _enable_tf32()
         _set_seed(42)
         config.update({
-            'max_length': 512,
-            'batch_size': 32,
-            'gradient_accumulation_steps': 2,
+            'max_length': 384,
+            'batch_size': 16,
+            'gradient_accumulation_steps': 4,
             'num_epochs': 3,
-            'dataloader_num_workers': 4,
+            'dataloader_num_workers': 2,
             'optim': 'adamw_torch_fused',
         })
     else:

@@ -98,29 +98,32 @@ def process_sft_sample(tokenizer, example: Dict, max_length: int = 512) -> Dict:
 
     assistant_content = _build_assistant_content(cot, answer)
 
-    messages = [
-        {"role": "system", "content": f"{instruction} 请按步骤解答，最后用\"答案：数字\"给出结果。"},
-        {"role": "user", "content": question},
-        {"role": "assistant", "content": assistant_content},
-    ]
+    system_text = f"{instruction} 请按步骤解答，最后用\"答案：数字\"给出结果。"
+    user_text = question
 
-    text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
-    all_ids = tokenizer(text, add_special_tokens=False)["input_ids"]
+    system_ids = tokenizer.encode(system_text, add_special_tokens=False)
+    user_ids = tokenizer.encode(user_text, add_special_tokens=False)
+    assistant_ids = tokenizer.encode(assistant_content, add_special_tokens=False)
 
-    prefix_messages = messages[:2]
-    prefix_text = tokenizer.apply_chat_template(prefix_messages, tokenize=False, add_generation_prompt=True)
-    prefix_ids = tokenizer(prefix_text, add_special_tokens=False)["input_ids"]
+    qwen_bos = tokenizer.encode("<|im_start|>", add_special_tokens=False)
+    qwen_sep = tokenizer.encode("<|im_end|>\n", add_special_tokens=False)
 
-    prefix_len = len(prefix_ids)
-    labels = [-100] * prefix_len + all_ids[prefix_len:]
+    input_ids = (
+        qwen_bos + system_ids + qwen_sep +
+        qwen_bos + user_ids + qwen_sep +
+        qwen_bos + assistant_ids + qwen_sep
+    )
 
-    if len(all_ids) > max_length:
-        all_ids = all_ids[:max_length]
+    prefix_len = len(qwen_bos) + len(system_ids) + len(qwen_sep) + len(qwen_bos) + len(user_ids) + len(qwen_sep) + len(qwen_bos)
+    labels = [-100] * prefix_len + assistant_ids + qwen_sep
+
+    if len(input_ids) > max_length:
+        input_ids = input_ids[:max_length]
         labels = labels[:max_length]
 
     return {
-        "input_ids": all_ids,
-        "attention_mask": [1] * len(all_ids),
+        "input_ids": input_ids,
+        "attention_mask": [1] * len(input_ids),
         "labels": labels,
     }
 
@@ -204,7 +207,6 @@ class COTTrainer:
         if device == "cpu":
             self.model = self.model.to(device)
 
-        self.model.enable_input_require_grads()
         print("模型加载完成")
 
     # ----------------------------------------------------------
@@ -266,9 +268,6 @@ class COTTrainer:
             warmup_ratio=self.config["warmup_ratio"],
             weight_decay=self.config["weight_decay"],
             lr_scheduler_type=self.config["lr_scheduler_type"],
-            save_on_each_node=True,
-            gradient_checkpointing=True,
-            gradient_checkpointing_kwargs={"use_reentrant": False},
             report_to="none",
             # 保留原始数据列，不自动删除模型不需要的字段
             # 这里我们的预处理已经生成了完整的 input_ids/attention_mask/labels
