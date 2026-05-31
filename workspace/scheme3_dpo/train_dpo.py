@@ -80,40 +80,24 @@ def _ensure_answer_suffix(text: str, answer: str) -> str:
         return f"{text.strip()}\n答案：{answer}"
 
 
-def prepare_dpo_dataset(preference_data_path: str, tokenizer=None, max_length: int = 384):
+def prepare_dpo_dataset(preference_data_path: str):
     """
-    将偏好数据转换为 DPOTrainer 要求的格式，支持预 tokenize 加速训练。
-
-    如果传入 tokenizer，则预 tokenize 数据并缓存到磁盘。
-    如果不传入 tokenizer，则返回 conversational 格式，由 DPOTrainer 内部处理。
+    将偏好数据转换为 DPOTrainer 要求的格式（trl >= 0.12.0 conversational格式）。
 
     输入格式（train_preference.json）:
         {"id": "0", "question": "...", "answer": "85",
          "chosen": "正确COT步骤", "rejected": "错误COT步骤"}
 
-    输出格式（预 tokenize 格式）:
+    输出格式（trl DPOTrainer conversational格式）:
         {
-            "prompt_input_ids": [...],
-            "prompt_attention_mask": [...],
-            "chosen_input_ids": [...],
-            "chosen_attention_mask": [...],
-            "chosen_labels": [...],
-            "rejected_input_ids": [...],
-            "rejected_attention_mask": [...],
-            "rejected_labels": [...],
+            "prompt": [{"role": "system", ...}, {"role": "user", ...}],
+            "chosen": [{"role": "assistant", "content": "正确COT步骤"}],
+            "rejected": [{"role": "assistant", "content": "错误COT步骤"}],
         }
+
+    注：Tokenization 由 DPOTrainer 内部根据 DPOConfig.max_length 自动处理。
     """
     from datasets import Dataset
-    import hashlib
-
-    # 检查缓存
-    cache_path = None
-    if tokenizer is not None:
-        base, ext = os.path.splitext(preference_data_path)
-        cache_path = f"{base}_dpo_tokenized_m{max_length}"
-        if os.path.exists(cache_path):
-            print(f"加载缓存的预tokenize数据: {cache_path}")
-            return Dataset.load_from_disk(cache_path)
 
     pref_data = load_json(preference_data_path)
     dpo_dataset = []
@@ -141,55 +125,14 @@ def prepare_dpo_dataset(preference_data_path: str, tokenizer=None, max_length: i
         err_ans = err_match.group(1) if err_match else "0"
         rejected = _ensure_answer_suffix(rejected_text, err_ans)
 
-        if tokenizer is not None:
-            prompt_text = tokenizer.apply_chat_template(
-                prompt, tokenize=False, add_generation_prompt=True
-            )
-            prompt_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
+        dpo_dataset.append({
+            "prompt": prompt,
+            "chosen": [{"role": "assistant", "content": chosen}],
+            "rejected": [{"role": "assistant", "content": rejected}],
+        })
 
-            chosen_str = chosen + tokenizer.eos_token
-            rejected_str = rejected + tokenizer.eos_token
-
-            chosen_completion_ids = tokenizer.encode(chosen_str, add_special_tokens=False)
-            rejected_completion_ids = tokenizer.encode(rejected_str, add_special_tokens=False)
-
-            # 分别截断 prompt 和 completion（合计不超过 max_length）
-            total_chosen = len(prompt_ids) + len(chosen_completion_ids)
-            total_rejected = len(prompt_ids) + len(rejected_completion_ids)
-
-            if total_chosen > max_length:
-                overflow = total_chosen - max_length
-                chosen_completion_ids = chosen_completion_ids[:max(0, len(chosen_completion_ids) - overflow)]
-            if total_rejected > max_length:
-                overflow = total_rejected - max_length
-                rejected_completion_ids = rejected_completion_ids[:max(0, len(rejected_completion_ids) - overflow)]
-
-            dpo_dataset.append({
-                "prompt_input_ids": prompt_ids,
-                "prompt_attention_mask": [1] * len(prompt_ids),
-                "chosen_input_ids": chosen_completion_ids,
-                "chosen_attention_mask": [1] * len(chosen_completion_ids),
-                "chosen_labels": chosen_completion_ids,
-                "rejected_input_ids": rejected_completion_ids,
-                "rejected_attention_mask": [1] * len(rejected_completion_ids),
-                "rejected_labels": rejected_completion_ids,
-            })
-        else:
-            dpo_dataset.append({
-                "prompt": prompt,
-                "chosen": [{"role": "assistant", "content": chosen}],
-                "rejected": [{"role": "assistant", "content": rejected}],
-            })
-
-    print(f"DPO数据集: {len(dpo_dataset)} 条" + ("（预tokenize）" if tokenizer else ""))
-    ds = Dataset.from_list(dpo_dataset)
-    
-    # 保存缓存
-    if tokenizer is not None and cache_path:
-        ds.save_to_disk(cache_path)
-        print(f"已缓存预tokenize数据: {cache_path}")
-    
-    return ds
+    print(f"DPO数据集: {len(dpo_dataset)} 条")
+    return Dataset.from_list(dpo_dataset)
 
 
 # ============================================================
@@ -325,9 +268,9 @@ def train_dpo(
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
 
-    # ---- 准备DPO数据（预tokenize加速）----
-    print("准备DPO数据（预tokenize）...")
-    dpo_data = prepare_dpo_dataset(pref_data_path, tokenizer, max_length)
+    # ---- 准备DPO数据 ----
+    print("准备DPO数据...")
+    dpo_data = prepare_dpo_dataset(pref_data_path)
 
     # ---- 创建DPOConfig ----
     print("创建DPO Trainer...")
