@@ -672,6 +672,13 @@ def train_grpo(
             print(f"  {actual_data_path} 不存在，使用 {fallback}")
             actual_data_path = fallback
 
+    # 检查是否已经训练完成
+    final_path = os.path.join(output_dir, "final")
+    if os.path.exists(final_path):
+        print(f"✓ 检测到已完成的GRPO模型: {final_path}")
+        print("  跳过训练（如需重新训练，请删除该目录）")
+        return None
+
     print_config({
         "sft_peft_path": sft_peft_path,
         "grpo_data_path": actual_data_path,
