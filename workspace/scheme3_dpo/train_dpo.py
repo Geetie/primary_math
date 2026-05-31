@@ -93,12 +93,14 @@ def prepare_dpo_dataset(preference_data_path: str, tokenizer=None, max_length: i
 
     输出格式（预 tokenize 格式）:
         {
-            "input_ids_chosen": [...],
-            "attention_mask_chosen": [...],
-            "labels_chosen": [...],
-            "input_ids_rejected": [...],
-            "attention_mask_rejected": [...],
-            "labels_rejected": [...],
+            "prompt_input_ids": [...],
+            "prompt_attention_mask": [...],
+            "chosen_input_ids": [...],
+            "chosen_attention_mask": [...],
+            "chosen_labels": [...],
+            "rejected_input_ids": [...],
+            "rejected_attention_mask": [...],
+            "rejected_labels": [...],
         }
     """
     from datasets import Dataset
@@ -143,24 +145,34 @@ def prepare_dpo_dataset(preference_data_path: str, tokenizer=None, max_length: i
             prompt_text = tokenizer.apply_chat_template(
                 prompt, tokenize=False, add_generation_prompt=True
             )
-            chosen_full = prompt_text + chosen + tokenizer.eos_token
-            rejected_full = prompt_text + rejected + tokenizer.eos_token
-
-            chosen_ids = tokenizer.encode(chosen_full, add_special_tokens=False, truncation=True, max_length=max_length)
-            rejected_ids = tokenizer.encode(rejected_full, add_special_tokens=False, truncation=True, max_length=max_length)
             prompt_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
-            prompt_len = min(len(prompt_ids), max_length)
 
-            chosen_labels = [-100] * prompt_len + chosen_ids[prompt_len:]
-            rejected_labels = [-100] * prompt_len + rejected_ids[prompt_len:]
+            chosen_str = chosen + tokenizer.eos_token
+            rejected_str = rejected + tokenizer.eos_token
+
+            chosen_completion_ids = tokenizer.encode(chosen_str, add_special_tokens=False)
+            rejected_completion_ids = tokenizer.encode(rejected_str, add_special_tokens=False)
+
+            # 分别截断 prompt 和 completion（合计不超过 max_length）
+            total_chosen = len(prompt_ids) + len(chosen_completion_ids)
+            total_rejected = len(prompt_ids) + len(rejected_completion_ids)
+
+            if total_chosen > max_length:
+                overflow = total_chosen - max_length
+                chosen_completion_ids = chosen_completion_ids[:max(0, len(chosen_completion_ids) - overflow)]
+            if total_rejected > max_length:
+                overflow = total_rejected - max_length
+                rejected_completion_ids = rejected_completion_ids[:max(0, len(rejected_completion_ids) - overflow)]
 
             dpo_dataset.append({
-                "input_ids_chosen": chosen_ids,
-                "attention_mask_chosen": [1] * len(chosen_ids),
-                "labels_chosen": chosen_labels,
-                "input_ids_rejected": rejected_ids,
-                "attention_mask_rejected": [1] * len(rejected_ids),
-                "labels_rejected": rejected_labels,
+                "prompt_input_ids": prompt_ids,
+                "prompt_attention_mask": [1] * len(prompt_ids),
+                "chosen_input_ids": chosen_completion_ids,
+                "chosen_attention_mask": [1] * len(chosen_completion_ids),
+                "chosen_labels": chosen_completion_ids,
+                "rejected_input_ids": rejected_completion_ids,
+                "rejected_attention_mask": [1] * len(rejected_completion_ids),
+                "rejected_labels": rejected_completion_ids,
             })
         else:
             dpo_dataset.append({
