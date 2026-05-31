@@ -293,7 +293,6 @@ def train_dpo(
         fp16=False,
         bf16=device != "cpu",
         remove_unused_columns=False,
-        generate_during_eval=False,
         dataloader_num_workers=dataloader_num_workers,
         dataloader_pin_memory=device != "cpu",
         optim=optim,

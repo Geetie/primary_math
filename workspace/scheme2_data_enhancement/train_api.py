@@ -292,12 +292,19 @@ class COTTrainer:
     # ----------------------------------------------------------
     # 训练
     # ----------------------------------------------------------
-    def train(self, resume: bool = True):
-        """开始训练，支持断点续训"""
+    def train(self, resume: bool = True, skip_if_exists: bool = True):
+        """开始训练，支持断点续训和跳过已完成训练"""
+        output_dir = self._resolve_relative_path(self.config["output_dir"])
+        final_path = os.path.join(output_dir, "final")
+        
+        if skip_if_exists and os.path.exists(final_path):
+            print(f"✓ 检测到已完成的模型: {final_path}")
+            print("  跳过训练（如需重新训练，请删除该目录）")
+            return
+        
         print("开始训练...")
         
         if resume:
-            output_dir = self._resolve_relative_path(self.config["output_dir"])
             checkpoint_dir = os.path.join(output_dir, "checkpoint-last")
             if os.path.exists(checkpoint_dir):
                 print(f"检测到 checkpoint，继续训练: {checkpoint_dir}")
@@ -308,7 +315,6 @@ class COTTrainer:
         else:
             self.trainer.train(resume_from_checkpoint=False)
 
-        final_path = os.path.join(self._resolve_relative_path(self.config["output_dir"]), "final")
         self.trainer.save_model(final_path)
         print(f"模型已保存: {final_path}")
 
