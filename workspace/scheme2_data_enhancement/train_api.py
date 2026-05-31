@@ -35,7 +35,11 @@ from utils.common import load_json, save_json, print_config, get_device, ensure_
 
 
 def _get_attn_impl():
-    return ensure_flash_attn()
+    try:
+        import flash_attn
+        return "flash_attention_2"
+    except ImportError:
+        return None
 
 
 # ============================================================
@@ -207,7 +211,8 @@ class COTTrainer:
         if device == "cpu":
             self.model = self.model.to(device)
 
-        print("模型加载完成")
+        actual_attn = getattr(self.model.config, '_attn_implementation', None) or getattr(self.model.config, 'attn_implementation', 'default')
+        print(f"模型加载完成 - Attention: {actual_attn}")
 
     # ----------------------------------------------------------
     # 数据准备

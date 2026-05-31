@@ -51,7 +51,11 @@ def _resolve_relative_path(path: str) -> str:
 
 
 def _get_attn_impl():
-    return ensure_flash_attn()
+    try:
+        import flash_attn
+        return "flash_attention_2"
+    except ImportError:
+        return None
 
 
 class GRPOConfig:

@@ -28,7 +28,11 @@ from utils.common import load_json, print_config, get_device, ensure_flash_attn,
 
 
 def _get_attn_impl():
-    return ensure_flash_attn()
+    try:
+        import flash_attn
+        return "flash_attention_2"
+    except ImportError:
+        return None
 
 # Qwen2.5 LoRA 目标模块
 QWEN_LORA_TARGET_MODULES = [

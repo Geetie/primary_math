@@ -45,7 +45,11 @@ def download_model_qwen(cache_dir: str = "./models/Qwen2.5-0.5B-Instruct") -> st
 
 
 def _get_attn_impl():
-    return ensure_flash_attn()
+    try:
+        import flash_attn
+        return "flash_attention_2"
+    except ImportError:
+        return None
 
 
 def load_model_and_tokenizer(model_path: str, use_peft: bool = False, peft_path: str = None, device: str = None):

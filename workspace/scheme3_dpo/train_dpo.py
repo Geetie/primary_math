@@ -40,7 +40,11 @@ def _resolve_relative_path(path: str) -> str:
 
 
 def _get_attn_impl():
-    return ensure_flash_attn()
+    try:
+        import flash_attn
+        return "flash_attention_2"
+    except ImportError:
+        return None
 
 
 QWEN_LORA_TARGET_MODULES = [
@@ -76,25 +80,38 @@ def _ensure_answer_suffix(text: str, answer: str) -> str:
         return f"{text.strip()}\n答案：{answer}"
 
 
-def prepare_dpo_dataset(preference_data_path: str):
+def prepare_dpo_dataset(preference_data_path: str, tokenizer=None, max_length: int = 384):
     """
-    将偏好数据转换为 DPOTrainer 要求的格式（trl >= 0.12.0 conversational格式）。
+    将偏好数据转换为 DPOTrainer 要求的格式，支持预 tokenize 加速训练。
+
+    如果传入 tokenizer，则预 tokenize 数据并缓存到磁盘。
+    如果不传入 tokenizer，则返回 conversational 格式，由 DPOTrainer 内部处理。
 
     输入格式（train_preference.json）:
         {"id": "0", "question": "...", "answer": "85",
          "chosen": "正确COT步骤", "rejected": "错误COT步骤"}
 
-    输出格式（trl DPOTrainer conversational格式）:
+    输出格式（预 tokenize 格式）:
         {
-            "prompt": [{"role": "system", ...}, {"role": "user", ...}],
-            "chosen": [{"role": "assistant", "content": "正确COT步骤"}],
-            "rejected": [{"role": "assistant", "content": "错误COT步骤"}],
+            "input_ids_chosen": [...],
+            "attention_mask_chosen": [...],
+            "labels_chosen": [...],
+            "input_ids_rejected": [...],
+            "attention_mask_rejected": [...],
+            "labels_rejected": [...],
         }
-
-    注：Tokenization 由 DPOTrainer 内部根据 DPOConfig.max_length 自动处理，
-        此处仅做格式转换。
     """
     from datasets import Dataset
+    import hashlib
+
+    # 检查缓存
+    cache_path = None
+    if tokenizer is not None:
+        base, ext = os.path.splitext(preference_data_path)
+        cache_path = f"{base}_dpo_tokenized_m{max_length}"
+        if os.path.exists(cache_path):
+            print(f"加载缓存的预tokenize数据: {cache_path}")
+            return Dataset.load_from_disk(cache_path)
 
     pref_data = load_json(preference_data_path)
     dpo_dataset = []
@@ -118,19 +135,49 @@ def prepare_dpo_dataset(preference_data_path: str):
 
         chosen = _ensure_answer_suffix(chosen_text, answer)
 
-        # rejected: 错误COT + 错误答案（去重处理）
         err_match = re.search(r'答案[：:]\s*(\S+)', rejected_text)
         err_ans = err_match.group(1) if err_match else "0"
         rejected = _ensure_answer_suffix(rejected_text, err_ans)
 
-        dpo_dataset.append({
-            "prompt": prompt,
-            "chosen": [{"role": "assistant", "content": chosen}],
-            "rejected": [{"role": "assistant", "content": rejected}],
-        })
+        if tokenizer is not None:
+            prompt_text = tokenizer.apply_chat_template(
+                prompt, tokenize=False, add_generation_prompt=True
+            )
+            chosen_full = prompt_text + chosen + tokenizer.eos_token
+            rejected_full = prompt_text + rejected + tokenizer.eos_token
 
-    print(f"DPO数据集: {len(dpo_dataset)} 条")
-    return Dataset.from_list(dpo_dataset)
+            chosen_ids = tokenizer.encode(chosen_full, add_special_tokens=False, truncation=True, max_length=max_length)
+            rejected_ids = tokenizer.encode(rejected_full, add_special_tokens=False, truncation=True, max_length=max_length)
+            prompt_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
+            prompt_len = min(len(prompt_ids), max_length)
+
+            chosen_labels = [-100] * prompt_len + chosen_ids[prompt_len:]
+            rejected_labels = [-100] * prompt_len + rejected_ids[prompt_len:]
+
+            dpo_dataset.append({
+                "input_ids_chosen": chosen_ids,
+                "attention_mask_chosen": [1] * len(chosen_ids),
+                "labels_chosen": chosen_labels,
+                "input_ids_rejected": rejected_ids,
+                "attention_mask_rejected": [1] * len(rejected_ids),
+                "labels_rejected": rejected_labels,
+            })
+        else:
+            dpo_dataset.append({
+                "prompt": prompt,
+                "chosen": [{"role": "assistant", "content": chosen}],
+                "rejected": [{"role": "assistant", "content": rejected}],
+            })
+
+    print(f"DPO数据集: {len(dpo_dataset)} 条" + ("（预tokenize）" if tokenizer else ""))
+    ds = Dataset.from_list(dpo_dataset)
+    
+    # 保存缓存
+    if tokenizer is not None and cache_path:
+        ds.save_to_disk(cache_path)
+        print(f"已缓存预tokenize数据: {cache_path}")
+    
+    return ds
 
 
 # ============================================================
@@ -221,6 +268,9 @@ def train_dpo(
         trust_remote_code=True,
         **attn_kwargs,
     )
+    
+    actual_attn = getattr(base_model.config, '_attn_implementation', None) or getattr(base_model.config, 'attn_implementation', 'default')
+    print(f"Attention 实现: {actual_attn}")
 
     if sft_peft_path and os.path.exists(sft_peft_path):
         is_peft = os.path.exists(os.path.join(sft_peft_path, "adapter_config.json"))
@@ -263,9 +313,9 @@ def train_dpo(
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
 
-    # ---- 准备DPO数据 ----
-    print("准备DPO数据...")
-    dpo_data = prepare_dpo_dataset(pref_data_path)
+    # ---- 准备DPO数据（预tokenize加速）----
+    print("准备DPO数据（预tokenize）...")
+    dpo_data = prepare_dpo_dataset(pref_data_path, tokenizer, max_length)
 
     # ---- 创建DPOConfig ----
     print("创建DPO Trainer...")

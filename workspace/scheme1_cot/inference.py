@@ -20,7 +20,11 @@ from .cot_prompts import create_messages_with_cot
 
 
 def _get_attn_impl():
-    return ensure_flash_attn()
+    try:
+        import flash_attn
+        return "flash_attention_2"
+    except ImportError:
+        return None
 
 
 # ============================================================
