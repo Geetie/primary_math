@@ -322,7 +322,14 @@ def train_dpo(
 
     # ---- 开始训练 ----
     print("开始DPO训练...")
-    dpo_trainer.train(resume_from_checkpoint=True)
+    
+    checkpoint_dir = os.path.join(output_dir, "checkpoint-last")
+    if os.path.exists(checkpoint_dir):
+        print(f"检测到 checkpoint，继续训练: {checkpoint_dir}")
+        dpo_trainer.train(resume_from_checkpoint=checkpoint_dir)
+    else:
+        print("未检测到 checkpoint，从头开始训练")
+        dpo_trainer.train(resume_from_checkpoint=False)
 
     # ---- 保存模型 ----
     final_path = os.path.join(output_dir, "final")

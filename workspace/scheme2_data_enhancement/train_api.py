@@ -296,8 +296,18 @@ class COTTrainer:
     def train(self, resume: bool = True):
         """开始训练，支持断点续训"""
         print("开始训练...")
-        # 使用 Trainer 自动查找最新 checkpoint，更健壮
-        self.trainer.train(resume_from_checkpoint=resume)
+        
+        if resume:
+            output_dir = self._resolve_relative_path(self.config["output_dir"])
+            checkpoint_dir = os.path.join(output_dir, "checkpoint-last")
+            if os.path.exists(checkpoint_dir):
+                print(f"检测到 checkpoint，继续训练: {checkpoint_dir}")
+                self.trainer.train(resume_from_checkpoint=checkpoint_dir)
+            else:
+                print("未检测到 checkpoint，从头开始训练")
+                self.trainer.train(resume_from_checkpoint=False)
+        else:
+            self.trainer.train(resume_from_checkpoint=False)
 
         final_path = os.path.join(self._resolve_relative_path(self.config["output_dir"]), "final")
         self.trainer.save_model(final_path)
