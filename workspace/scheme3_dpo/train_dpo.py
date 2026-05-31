@@ -252,8 +252,6 @@ def train_dpo(
     if device == "cpu":
         model = model.to(device)
 
-    model.enable_input_require_grads()
-
     lora_config = LoraConfig(
         task_type=TaskType.CAUSAL_LM,
         target_modules=QWEN_LORA_TARGET_MODULES,
@@ -275,8 +273,6 @@ def train_dpo(
         output_dir=output_dir,
         per_device_train_batch_size=batch_size,
         gradient_accumulation_steps=gradient_accumulation_steps,
-        gradient_checkpointing=True,
-        gradient_checkpointing_kwargs={"use_reentrant": False},
         logging_steps=10,
         num_train_epochs=num_epochs,
         save_strategy="steps",

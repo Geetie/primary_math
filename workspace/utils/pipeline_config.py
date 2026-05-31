@@ -235,15 +235,15 @@ def get_dpo_config(device: str = None, paths: dict = None) -> dict:
         'pref_data_path': paths['train_preference'],
         'output_dir': os.path.join(paths['output_dir'], 'scheme3_dpo'),
         'device': device,
-        'learning_rate': 5e-5,
-        'beta': 0.1,
+        'learning_rate': 3e-5,
+        'beta': 0.3,
         'weight_decay': 0.01,
         'max_length': 512 if is_gpu else 256,
-        'dataloader_num_workers': 4 if is_gpu else 0,
+        'dataloader_num_workers': 2 if is_gpu else 0,
         'lora_r': 8,
         'lora_alpha': 16,
         'lora_dropout': 0.05,
-        'save_steps': 500,
+        'save_steps': 1000,
         'seed': 42,
     }
 
@@ -251,7 +251,7 @@ def get_dpo_config(device: str = None, paths: dict = None) -> dict:
         config.update({
             'batch_size': 8,
             'gradient_accumulation_steps': 2,
-            'num_epochs': 3,
+            'num_epochs': 2,
             'optim': 'adamw_torch_fused',
         })
     else:
