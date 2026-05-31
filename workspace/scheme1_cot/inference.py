@@ -16,7 +16,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 from peft import PeftModel
 
 from utils.common import load_json, save_csv, extract_number, get_device, check_model_downloaded, ensure_flash_attn
-from scheme1_cot.cot_prompts import create_messages_with_cot
+from .cot_prompts import create_messages_with_cot
 
 
 def _get_attn_impl():

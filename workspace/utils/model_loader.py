@@ -6,10 +6,9 @@
 import os
 import sys
 
-# 添加项目根目录到路径
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from utils.common import check_model_downloaded, ensure_flash_attn
+from .common import check_model_downloaded, ensure_flash_attn
 
 
 def download_model_qwen(cache_dir: str = "./models/Qwen2.5-0.5B-Instruct") -> str:

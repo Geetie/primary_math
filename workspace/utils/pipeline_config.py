@@ -16,7 +16,7 @@ import json
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from utils.common import get_device as _get_device, enable_tf32 as _enable_tf32, set_seed as _set_seed
+from .common import get_device as _get_device, enable_tf32 as _enable_tf32, set_seed as _set_seed
 
 
 def get_device() -> str:
