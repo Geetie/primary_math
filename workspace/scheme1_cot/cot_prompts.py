@@ -33,6 +33,7 @@ PROMPT_MAP = {
     "zero_shot_simple": ZERO_SHOT_COT_SIMPLE,
     "zero_shot": ZERO_SHOT_COT,
     "few_shot": FEW_SHOT_COT_EXAMPLES,
+    "grpo": ZERO_SHOT_COT,
 }
 
 
