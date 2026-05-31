@@ -18,6 +18,10 @@ ZERO_SHOT_COT = (
     "答案：数字（仅数字，不带单位）"
 )
 
+SFT_PROMPT = "解答这道小学数学题。 请按步骤解答，最后用\"答案：数字\"给出结果。"
+
+DPO_PROMPT = "解答小学数学题，按步骤解答，最后用\"答案：数字\"给出结果。"
+
 # ===== Few-shot COT（仅1个示例，适配0.5B小上下文） =====
 FEW_SHOT_COT_EXAMPLES = (
     "解答小学数学题。\n"
@@ -33,6 +37,8 @@ PROMPT_MAP = {
     "zero_shot_simple": ZERO_SHOT_COT_SIMPLE,
     "zero_shot": ZERO_SHOT_COT,
     "few_shot": FEW_SHOT_COT_EXAMPLES,
+    "sft": SFT_PROMPT,
+    "dpo": DPO_PROMPT,
     "grpo": ZERO_SHOT_COT,
 }
 
