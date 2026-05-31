@@ -238,7 +238,7 @@ def get_dpo_config(device: str = None, paths: dict = None) -> dict:
         'learning_rate': 3e-5,
         'beta': 0.3,
         'weight_decay': 0.01,
-        'max_length': 512 if is_gpu else 256,
+        'max_length': 384 if is_gpu else 256,
         'dataloader_num_workers': 2 if is_gpu else 0,
         'lora_r': 8,
         'lora_alpha': 16,
@@ -249,8 +249,8 @@ def get_dpo_config(device: str = None, paths: dict = None) -> dict:
 
     if is_gpu:
         config.update({
-            'batch_size': 8,
-            'gradient_accumulation_steps': 2,
+            'batch_size': 4,
+            'gradient_accumulation_steps': 4,
             'num_epochs': 2,
             'optim': 'adamw_torch_fused',
         })
