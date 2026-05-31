@@ -755,7 +755,6 @@ def train_grpo(
     checkpoint_path = GRPOTrainer.find_latest_checkpoint(output_dir)
     if checkpoint_path:
         print(f"从 checkpoint 恢复模型权重: {checkpoint_path}")
-        from peft import PeftModel
         model = PeftModel.from_pretrained(model.get_base_model(), checkpoint_path)
         print(f"已从 checkpoint 恢复模型权重")
 
