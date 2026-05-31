@@ -320,6 +320,9 @@ class GRPOTrainer:
                 eos_token_id=self.tokenizer.eos_token_id,
             )
 
+        if was_training:
+            self.model.train()
+
         generated_cpu = generated.cpu()
         del generated
         if torch.cuda.is_available():
@@ -383,9 +386,6 @@ class GRPOTrainer:
         ]
         for i, lp in log_probs_list:
             result_log_probs[i] = lp
-
-        if was_training:
-            self.model.train()
 
         return responses, result_log_probs
 
@@ -640,7 +640,7 @@ def train_grpo(
     group_size: int = 8,
     num_iterations: int = 3,
     learning_rate: float = 5e-6,
-    max_new_tokens: int = 256,
+    max_new_tokens: int = None,
     max_length: int = 512,
     max_samples: int = None,
     max_steps_per_epoch: int = 1000,
@@ -763,7 +763,8 @@ def train_grpo(
     config.gradient_accumulation_steps = gradient_accumulation_steps
     config.max_length = max_length
     config.weight_decay = weight_decay
-    config.max_new_tokens = max_new_tokens
+    if max_new_tokens is not None:
+        config.max_new_tokens = max_new_tokens
 
     trainer = GRPOTrainer(model, tokenizer, config, output_dir, optim=optim)
     trainer.train(

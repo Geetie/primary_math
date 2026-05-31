@@ -194,6 +194,13 @@ def train_dpo(
     pref_data_path = _resolve_relative_path(pref_data_path)
     output_dir = _resolve_relative_path(output_dir)
 
+    # 检查是否已经训练完成
+    final_path = os.path.join(output_dir, "final")
+    if os.path.exists(final_path):
+        print(f"✓ 检测到已完成的DPO模型: {final_path}")
+        print("  跳过训练（如需重新训练，请删除该目录）")
+        return None, None, None
+
     print_config({
         "sft_peft_path": sft_peft_path,
         "pref_data_path": pref_data_path,

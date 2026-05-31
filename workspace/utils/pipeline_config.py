@@ -291,7 +291,7 @@ def get_grpo_config(device: str = None, paths: dict = None) -> dict:
         'learning_rate': 5e-6,
         'weight_decay': 0.01,
         'max_length': 512 if is_gpu else 256,
-        'max_steps_per_epoch': 500 if is_gpu else 10,
+        'max_steps_per_epoch': 250 if is_gpu else 10,
         'gradient_accumulation_steps': 2,
         'save_steps': 50,
         'dataloader_num_workers': 4 if is_gpu else 0,
@@ -303,9 +303,9 @@ def get_grpo_config(device: str = None, paths: dict = None) -> dict:
 
     if is_gpu:
         config.update({
-            'group_size': 8,
+            'group_size': 6,
             'num_iterations': 3,
-            'max_new_tokens': 256,
+            'max_new_tokens': 128,
             'optim': 'adamw_torch_fused',
         })
     else:
