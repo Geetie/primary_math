@@ -606,6 +606,25 @@ class GRPOTrainer:
                     epoch_metrics["kl"].append(group_kl / active_samples)
 
                 epoch_metrics["reward"].extend(rewards)
+                
+                # 更新进度条显示信息
+                if len(epoch_metrics["loss"]) > 0:
+                    current_avg_loss = sum(epoch_metrics["loss"][-20:]) / min(len(epoch_metrics["loss"][-20:]), 1)
+                    current_avg_kl = sum(epoch_metrics["kl"][-20:]) / min(len(epoch_metrics["kl"][-20:]), 1)
+                    current_avg_reward = sum(epoch_metrics["reward"][-20:]) / min(len(epoch_metrics["reward"][-20:]), 1)
+                    progress_bar.set_postfix({
+                        "loss": f"{current_avg_loss:.4f}",
+                        "reward": f"{current_avg_reward:.3f}",
+                        "kl": f"{current_avg_kl:.4f}",
+                        "lr": f"{self.optimizer.param_groups[0]['lr']:.2e}"
+                    }, refresh=False)
+                elif len(epoch_metrics["reward"]) > 0:
+                    current_avg_reward = sum(epoch_metrics["reward"][-20:]) / min(len(epoch_metrics["reward"][-20:]), 1)
+                    progress_bar.set_postfix({
+                        "reward": f"{current_avg_reward:.3f}",
+                        "lr": f"{self.optimizer.param_groups[0]['lr']:.2e}"
+                    }, refresh=False)
+                
                 global_step += 1
                 step_in_epoch += 1
                 progress_bar.update(1)
