@@ -30,7 +30,17 @@ def ensure_model_downloaded(model_dir: str) -> str:
     print(f"模型目录不存在: {model_dir}")
     print("尝试自动下载 Qwen2.5-0.5B-Instruct ...")
 
-    cache_dir = os.path.dirname(os.path.dirname(model_dir))
+    target_dir = os.path.dirname(model_dir)
+
+    if os.path.exists('/mnt/workspace'):
+        cache_dir = os.path.join('/mnt/workspace', 'models')
+    elif os.path.exists('/kaggle'):
+        cache_dir = '/kaggle/models'
+    else:
+        cache_dir = target_dir
+
+    os.makedirs(cache_dir, exist_ok=True)
+    print(f"模型下载目标目录: {cache_dir}")
 
     try:
         from modelscope import snapshot_download
@@ -38,6 +48,11 @@ def ensure_model_downloaded(model_dir: str) -> str:
             'Qwen/Qwen2.5-0.5B-Instruct',
             cache_dir=cache_dir,
         )
+        model_name = 'Qwen2___5-0___5B-Instruct'
+        expected_path = os.path.join(cache_dir, 'qwen', model_name)
+        if os.path.exists(expected_path):
+            print(f"模型已下载到: {expected_path}")
+            return expected_path
         print(f"模型已下载到: {downloaded}")
         return downloaded
     except ImportError:
