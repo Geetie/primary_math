@@ -157,7 +157,7 @@ def _single_generate(model, tokenizer, prompts, max_new_tokens):
 # ============================================================
 
 def inference_with_cot(model, tokenizer, test_data, prompt_type: str = "zero_shot",
-                       batch_size: int = 8, device: str = "cpu"):
+                       batch_size: int = 8, device: str = "cpu", max_new_tokens: int = 128):
     """
     使用指定 COT 提示推理，带异常容错。
 
@@ -170,7 +170,7 @@ def inference_with_cot(model, tokenizer, test_data, prompt_type: str = "zero_sho
     ]
 
     responses = batch_predict(model, tokenizer, messages_list,
-                              max_new_tokens=128, batch_size=batch_size, device=device)
+                              max_new_tokens=max_new_tokens, batch_size=batch_size, device=device)
 
     results = []
     empty_count = 0

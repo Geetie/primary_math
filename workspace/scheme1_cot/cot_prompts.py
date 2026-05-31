@@ -41,16 +41,20 @@ def get_cot_prompt(prompt_type: str = "zero_shot") -> str:
     return PROMPT_MAP.get(prompt_type, ZERO_SHOT_COT)
 
 
-def create_messages_with_cot(question: str, prompt_type: str = "zero_shot") -> list:
+def create_messages_with_cot(question, prompt_type: str = "zero_shot") -> list:
     """
     创建带COT的消息列表
 
     Args:
-        question: 问题文本
+        question: 问题文本（str 或 list）
         prompt_type: 提示类型
     Returns:
         messages列表
     """
+    # 处理 question 可能是 list 的情况
+    if isinstance(question, list):
+        question = "".join(question) if question else ""
+    
     return [
         {"role": "system", "content": get_cot_prompt(prompt_type)},
         {"role": "user", "content": question},
