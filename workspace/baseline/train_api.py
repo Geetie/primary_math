@@ -24,7 +24,11 @@ from transformers import (
 )
 from peft import LoraConfig, TaskType, get_peft_model
 
-from utils.common import load_json, print_config, get_device
+from utils.common import load_json, print_config, get_device, ensure_flash_attn, enable_tf32, set_seed
+
+
+def _get_attn_impl():
+    return ensure_flash_attn()
 
 # Qwen2.5 LoRA 目标模块
 QWEN_LORA_TARGET_MODULES = [
@@ -77,8 +81,8 @@ class BaselineTrainer:
         "lora_r": 8,
         "lora_alpha": 16,
         "lora_dropout": 0.05,
-        "batch_size": 4,
-        "gradient_accumulation_steps": 4,
+        "batch_size": 8,
+        "gradient_accumulation_steps": 2,
         "num_epochs": 3,
         "learning_rate": 2e-4,
         "warmup_ratio": 0.1,
@@ -105,17 +109,22 @@ class BaselineTrainer:
 
         model_path = self.config["model_cache_dir"]
         self.tokenizer = AutoTokenizer.from_pretrained(
-            model_path, use_fast=False, trust_remote_code=True
+            model_path, use_fast=True, trust_remote_code=True
         )
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_path,
-            device_map=device if device != "cpu" else None,
-            torch_dtype=torch.bfloat16 if device != "cpu" else torch.float32,
-            trust_remote_code=True,
-        )
+        model_kwargs = {"trust_remote_code": True}
+        if device != "cpu":
+            model_kwargs["device_map"] = {"": device}
+            model_kwargs["torch_dtype"] = torch.bfloat16
+            attn_impl = _get_attn_impl()
+            if attn_impl:
+                model_kwargs["attn_implementation"] = attn_impl
+        else:
+            model_kwargs["torch_dtype"] = torch.float32
+
+        self.model = AutoModelForCausalLM.from_pretrained(model_path, **model_kwargs)
         if device == "cpu":
             self.model = self.model.to(device)
         self.model.enable_input_require_grads()
@@ -167,11 +176,15 @@ class BaselineTrainer:
             lr_scheduler_type=self.config["lr_scheduler_type"],
             save_on_each_node=True,
             gradient_checkpointing=True,
+            gradient_checkpointing_kwargs={"use_reentrant": False},
             report_to="none",
             remove_unused_columns=False,
             fp16=False,
             bf16=self.device != "cpu",
-            dataloader_num_workers=2,
+            dataloader_num_workers=self.config.get("dataloader_num_workers", 2),
+            dataloader_pin_memory=self.device != "cpu",
+            optim=self.config.get("optim", "adamw_torch"),
+            seed=self.config.get("seed", 42),
         )
         self.trainer = Trainer(
             model=self.model,

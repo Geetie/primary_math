@@ -73,6 +73,91 @@ def get_device() -> str:
         return "cpu"
 
 
+def ensure_flash_attn() -> str:
+    """
+    确保 flash-attn 可用。在 GPU 环境下自动安装（ModelScope A10 等）。
+    安装失败则回退到默认注意力实现。
+
+    Returns:
+        "flash_attention_2" 或 None
+    """
+    try:
+        import flash_attn
+        return "flash_attention_2"
+    except ImportError:
+        pass
+
+    import torch
+    if not torch.cuda.is_available():
+        print("CPU 环境，跳过 flash-attn 安装")
+        return None
+
+    import subprocess
+    import sys
+
+    print("flash-attn 未安装，尝试自动安装 (pip install flash-attn --no-build-isolation) ...")
+    print("  ⏳ 编译可能需要 3-10 分钟，请耐心等待...")
+
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "flash-attn", "--no-build-isolation"],
+            capture_output=True,
+            text=True,
+            timeout=1800,
+        )
+        if result.returncode == 0:
+            try:
+                import flash_attn
+                print(f"  ✅ flash-attn 安装成功: {flash_attn.__version__}")
+                return "flash_attention_2"
+            except ImportError:
+                print("  ⚠️ flash-attn 安装后仍无法导入，回退到默认注意力")
+        else:
+            print(f"  ⚠️ flash-attn 安装失败 (exit code {result.returncode})")
+            if result.stderr:
+                for line in result.stderr.strip().split('\n')[-3:]:
+                    print(f"    {line}")
+    except subprocess.TimeoutExpired:
+        print("  ⚠️ flash-attn 安装超时，回退到默认注意力")
+    except Exception as e:
+        print(f"  ⚠️ flash-attn 安装异常: {e}，回退到默认注意力")
+
+    return None
+
+
+def enable_tf32():
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return False
+        cap = torch.cuda.get_device_capability()
+        if cap[0] >= 8:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            print(f"TF32 已启用 (GPU计算能力: {cap[0]}.{cap[1]})")
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def set_seed(seed: int = 42):
+    import random
+    random.seed(seed)
+    try:
+        import numpy as np
+        np.random.seed(seed)
+    except ImportError:
+        pass
+    try:
+        import torch
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+    except ImportError:
+        pass
+
+
 def format_time(seconds: float) -> str:
     """格式化时间显示"""
     if seconds < 60:

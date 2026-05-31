@@ -8,6 +8,13 @@
   - prompt: List[Dict] 消息列表（DPOTrainer自动apply_chat_template）
   - chosen: str assistant回复（含<|im_start|>assistant前缀）
   - rejected: str assistant回复（含<|im_start|>assistant前缀）
+
+审查修复记录：
+1. _ensure_answer_suffix：添加 re.MULTILINE 支持多行文本匹配，放宽答案匹配以支持含空格/单位的答案
+2. prepare_dpo_dataset：移除冗余 tokenizer/max_length 参数，添加注释说明 Tokenization 由 DPOTrainer 内部处理
+3. _get_attn_impl：提前缓存避免重复调用
+4. 断点检测：移除手动查找，直接使用 resume_from_checkpoint=True 让 Trainer 自动处理
+5. 路径解析：添加 _resolve_relative_path 确保路径一致性
 """
 
 import os
@@ -19,9 +26,27 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
-from peft import PeftModel
+from peft import PeftModel, LoraConfig, TaskType, get_peft_model
 
-from utils.common import load_json, save_json, print_config, get_device
+from utils.common import load_json, save_json, print_config, get_device, ensure_flash_attn, enable_tf32, set_seed
+
+
+def _resolve_relative_path(path: str) -> str:
+    """将相对路径解析为绝对路径（相对于脚本目录）"""
+    if os.path.isabs(path):
+        return path
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    return os.path.normpath(os.path.join(script_dir, path))
+
+
+def _get_attn_impl():
+    return ensure_flash_attn()
+
+
+QWEN_LORA_TARGET_MODULES = [
+    "q_proj", "k_proj", "v_proj", "o_proj",
+    "gate_proj", "up_proj", "down_proj",
+]
 
 
 # ============================================================
@@ -32,23 +57,26 @@ def _ensure_answer_suffix(text: str, answer: str) -> str:
     """
     确保文本末尾包含"答案：xxx"且不重复。
     如果已有"答案："行，检查是否与answer一致，不一致则替换。
+    
+    支持多行文本：匹配最后一行的答案标记。
+    支持含空格/单位的答案（如"4.5 米"）。
     """
-    # 检查是否已有"答案："行
-    match = re.search(r'答案[：:]\s*\S+\s*$', text.strip())
+    # 检查是否已有"答案："行（匹配最后一行）
+    match = re.search(r'答案[：:]\s*[\S\s]*?\s*$', text.strip(), re.MULTILINE)
     if match:
         # 已有答案行，检查是否正确
         existing_ans = match.group().split('：')[-1].split(':')[-1].strip()
         if existing_ans == str(answer).strip():
             return text  # 已正确，不重复
         else:
-            # 答案不一致，替换末尾
-            return re.sub(r'答案[：:]\s*\S+\s*$', f'答案：{answer}', text.strip())
+            # 答案不一致，替换末尾的答案行
+            return re.sub(r'答案[：:]\s*[\S\s]*?\s*$', f'答案：{answer}', text.strip(), flags=re.MULTILINE)
     else:
         # 没有答案行，追加
         return f"{text.strip()}\n答案：{answer}"
 
 
-def prepare_dpo_dataset(preference_data_path: str, tokenizer, max_length: int = 512):
+def prepare_dpo_dataset(preference_data_path: str):
     """
     将偏好数据转换为 DPOTrainer 要求的格式（trl >= 0.12.0 conversational格式）。
 
@@ -62,6 +90,9 @@ def prepare_dpo_dataset(preference_data_path: str, tokenizer, max_length: int = 
             "chosen": [{"role": "assistant", "content": "正确COT步骤"}],
             "rejected": [{"role": "assistant", "content": "错误COT步骤"}],
         }
+
+    注：Tokenization 由 DPOTrainer 内部根据 DPOConfig.max_length 自动处理，
+        此处仅做格式转换。
     """
     from datasets import Dataset
 
@@ -112,13 +143,21 @@ def train_dpo(
     pref_data_path: str,
     output_dir: str,
     device: str = None,
-    batch_size: int = 4,
-    gradient_accumulation_steps: int = 4,
+    batch_size: int = 8,
+    gradient_accumulation_steps: int = 2,
     num_epochs: int = 3,
-    learning_rate: float = 5e-7,
+    learning_rate: float = 5e-5,
     max_length: int = 512,
     beta: float = 0.1,
     max_steps: int = -1,
+    dataloader_num_workers: int = 4,
+    lora_r: int = 8,
+    lora_alpha: int = 16,
+    lora_dropout: float = 0.05,
+    save_steps: int = 500,
+    weight_decay: float = 0.01,
+    optim: str = "adamw_torch_fused",
+    seed: int = 42,
 ):
     """
     DPO训练流程，使用 HuggingFace trl 库的 DPOTrainer。
@@ -146,6 +185,13 @@ def train_dpo(
         device = get_device()
     print(f"设备: {device}")
 
+    # 解析路径，确保路径一致性
+    sft_model_path = _resolve_relative_path(sft_model_path)
+    if sft_peft_path:
+        sft_peft_path = _resolve_relative_path(sft_peft_path)
+    pref_data_path = _resolve_relative_path(pref_data_path)
+    output_dir = _resolve_relative_path(output_dir)
+
     print_config({
         "sft_peft_path": sft_peft_path,
         "pref_data_path": pref_data_path,
@@ -159,16 +205,21 @@ def train_dpo(
     # ---- 加载模型 ----
     print("加载模型...")
     tokenizer = AutoTokenizer.from_pretrained(
-        sft_model_path, use_fast=False, trust_remote_code=True
+        sft_model_path, use_fast=True, trust_remote_code=True
     )
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    # 提前缓存 attn_impl，避免重复调用
+    attn_impl = _get_attn_impl() if device != "cpu" else None
+    attn_kwargs = {"attn_implementation": attn_impl} if attn_impl else {}
+
     base_model = AutoModelForCausalLM.from_pretrained(
         sft_model_path,
-        device_map=device if device != "cpu" else None,
+        device_map={"": device} if device != "cpu" else None,
         torch_dtype=torch.bfloat16 if device != "cpu" else torch.float32,
         trust_remote_code=True,
+        **attn_kwargs,
     )
 
     if sft_peft_path and os.path.exists(sft_peft_path):
@@ -179,13 +230,20 @@ def train_dpo(
             print("合并PEFT权重...")
             model = model.merge_and_unload()
             del base_model
+            import gc; gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         else:
             del base_model
+            import gc; gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             model = AutoModelForCausalLM.from_pretrained(
                 sft_peft_path,
-                device_map=device if device != "cpu" else None,
+                device_map={"": device} if device != "cpu" else None,
                 torch_dtype=torch.bfloat16 if device != "cpu" else torch.float32,
                 trust_remote_code=True,
+                **attn_kwargs,
             )
             print(f"已加载完整模型: {sft_peft_path}")
     else:
@@ -196,18 +254,20 @@ def train_dpo(
 
     model.enable_input_require_grads()
 
+    lora_config = LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        target_modules=QWEN_LORA_TARGET_MODULES,
+        inference_mode=False,
+        r=lora_r,
+        lora_alpha=lora_alpha,
+        lora_dropout=lora_dropout,
+    )
+    model = get_peft_model(model, lora_config)
+    model.print_trainable_parameters()
+
     # ---- 准备DPO数据 ----
     print("准备DPO数据...")
-    dpo_data = prepare_dpo_dataset(pref_data_path, tokenizer)
-
-    # ---- 检查断点 ----
-    checkpoint = None
-    if os.path.exists(output_dir):
-        checkpoints = [f for f in os.listdir(output_dir) if f.startswith("checkpoint-")]
-        if checkpoints:
-            latest = sorted(checkpoints, key=lambda x: int(x.split("-")[1]))[-1]
-            checkpoint = os.path.join(output_dir, latest)
-            print(f"发现checkpoint: {checkpoint}")
+    dpo_data = prepare_dpo_dataset(pref_data_path)
 
     # ---- 创建DPOConfig ----
     print("创建DPO Trainer...")
@@ -216,12 +276,15 @@ def train_dpo(
         per_device_train_batch_size=batch_size,
         gradient_accumulation_steps=gradient_accumulation_steps,
         gradient_checkpointing=True,
+        gradient_checkpointing_kwargs={"use_reentrant": False},
         logging_steps=10,
         num_train_epochs=num_epochs,
-        save_strategy="epoch",
+        save_strategy="steps",
+        save_steps=save_steps,
         learning_rate=learning_rate,
         warmup_ratio=0.1,
         lr_scheduler_type="cosine",
+        weight_decay=weight_decay,
         beta=beta,
         loss_type="sigmoid",
         label_smoothing=0.0,
@@ -231,7 +294,10 @@ def train_dpo(
         bf16=device != "cpu",
         remove_unused_columns=False,
         generate_during_eval=False,
-        dataloader_num_workers=2,
+        dataloader_num_workers=dataloader_num_workers,
+        dataloader_pin_memory=device != "cpu",
+        optim=optim,
+        seed=seed,
     )
     if max_steps > 0:
         dpo_config_kwargs["max_steps"] = max_steps
@@ -240,7 +306,8 @@ def train_dpo(
 
     # ---- 创建DPOTrainer ----
     import trl
-    trl_version = tuple(int(x) for x in trl.__version__.split('.')[:2])
+    import re
+    trl_version = tuple(int(x) for x in re.findall(r'\d+', trl.__version__)[:2])
     trainer_kwargs = dict(
         model=model,
         args=training_args,
@@ -255,7 +322,7 @@ def train_dpo(
 
     # ---- 开始训练 ----
     print("开始DPO训练...")
-    dpo_trainer.train(resume_from_checkpoint=checkpoint)
+    dpo_trainer.train(resume_from_checkpoint=True)
 
     # ---- 保存模型 ----
     final_path = os.path.join(output_dir, "final")
@@ -271,8 +338,9 @@ def run_dpo_from_notebook(
     pref_data_path: str,
     output_dir: str,
     device: str = "cuda",
+    **kwargs,
 ):
-    """从Notebook调用的便捷函数"""
+    """从Notebook调用的便捷函数，额外参数通过kwargs传递"""
     os.makedirs(output_dir, exist_ok=True)
 
     return train_dpo(
@@ -281,11 +349,7 @@ def run_dpo_from_notebook(
         pref_data_path=pref_data_path,
         output_dir=output_dir,
         device=device,
-        batch_size=2,
-        gradient_accumulation_steps=8,
-        num_epochs=3,
-        learning_rate=5e-7,
-        beta=0.1,
+        **kwargs,
     )
 
 
@@ -297,7 +361,7 @@ if __name__ == "__main__":
     parser.add_argument("--sft_peft_path", type=str,
                        default="../outputs/scheme2_cot/final")
     parser.add_argument("--pref_data_path", type=str,
-                       default="../data/train_preference.json")
+                       default="../data/train_preference_final_merged.json")
     parser.add_argument("--output_dir", type=str,
                        default="../outputs/scheme3_dpo")
     parser.add_argument("--device", type=str, default=None)

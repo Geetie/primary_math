@@ -13,6 +13,16 @@ A10 24GB 优化：
 - 混合精度训练：bf16 autocast
 - 采样+log_prob合并：减少冗余前向传播
 - mini-batch训练：控制每轮步数
+
+审查修复记录：
+1. optimizer_step 持久化：修复断点续训时 warmup 重启问题
+2. 指标记录：移到条件外部，每次都记录 loss/kl
+3. DataLoader seed：固定 shuffle 种子，确保断点续训可复现
+4. empty_cache 频率：从 100 步降低到 500 步
+5. CLI 默认值：统一 group_size 默认值为 8
+6. _get_attn_impl：提前缓存避免重复调用
+7. 死代码删除：移除未使用的 compute_response_log_probs
+8. 路径解析：添加 _resolve_relative_path 确保路径一致性
 """
 
 import os
@@ -29,19 +39,31 @@ from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from peft import PeftModel
 
-from utils.common import load_json, print_config, get_device
+from utils.common import load_json, print_config, get_device, ensure_flash_attn, enable_tf32, set_seed
+
+
+def _resolve_relative_path(path: str) -> str:
+    """将相对路径解析为绝对路径（相对于脚本目录）"""
+    if os.path.isabs(path):
+        return path
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    return os.path.normpath(os.path.join(script_dir, path))
+
+
+def _get_attn_impl():
+    return ensure_flash_attn()
 
 
 class GRPOConfig:
     """GRPO训练配置"""
     group_size: int = 4
     num_epochs: int = 3
-    max_steps_per_epoch: int = 200
+    max_steps_per_epoch: int = 1000
     max_length: int = 512
     max_new_tokens: int = 128
     gradient_accumulation_steps: int = 2
 
-    learning_rate: float = 1e-6
+    learning_rate: float = 5e-6
     weight_decay: float = 0.01
     warmup_ratio: float = 0.1
 
@@ -105,42 +127,6 @@ def compute_group_relative_advantages(rewards: List[float]) -> List[float]:
 
     advantages = [(r - mean_reward) / std_reward for r in rewards]
     return advantages
-
-
-def compute_response_log_probs(
-    model, tokenizer, prompt_text: str, response: str,
-    max_length: int = 512, no_grad: bool = True,
-) -> Tuple[torch.Tensor, int]:
-    prompt_ids = tokenizer(prompt_text, add_special_tokens=True)["input_ids"]
-    prompt_len = len(prompt_ids)
-
-    response_ids = tokenizer(response, add_special_tokens=False)["input_ids"]
-
-    full_ids = prompt_ids + response_ids
-    if len(full_ids) > max_length:
-        full_ids = full_ids[:max_length]
-        response_ids = full_ids[prompt_len:]
-
-    input_ids = torch.tensor([full_ids], device=model.device)
-
-    ctx = torch.no_grad() if no_grad else torch.enable_grad()
-    with ctx:
-        outputs = model(input_ids=input_ids)
-        logits = outputs.logits[0]
-
-    response_len = len(response_ids)
-    if response_len == 0:
-        return torch.tensor([], device=model.device), 0
-
-    resp_logits = logits[prompt_len - 1: prompt_len - 1 + response_len]
-    resp_ids_tensor = torch.tensor(response_ids, device=model.device)
-
-    log_probs = F.log_softmax(resp_logits, dim=-1)
-    token_log_probs = log_probs.gather(
-        -1, resp_ids_tensor.unsqueeze(-1)
-    ).squeeze(-1)
-
-    return token_log_probs, response_len
 
 
 def compute_grpo_loss(
@@ -220,75 +206,240 @@ class GRPOTrainer:
         self.config = config or GRPOConfig()
         self.output_dir = output_dir
 
-        self.optimizer = torch.optim.AdamW(
-            self.model.parameters(),
-            lr=self.config.learning_rate,
-            weight_decay=self.config.weight_decay,
-        )
+        self.optimizer = self._create_optimizer(config)
+        self.scheduler = None
 
         os.makedirs(output_dir, exist_ok=True)
 
-    def _sample_with_log_probs(
-        self, prompt: str, group_size: int = 4,
-    ) -> Tuple[List[str], List[torch.Tensor]]:
+    def _create_optimizer(self, config):
+        params = [p for p in self.model.parameters() if p.requires_grad]
+        try:
+            return torch.optim.AdamW(
+                params,
+                lr=config.learning_rate,
+                weight_decay=config.weight_decay,
+                fused=True,
+            )
+        except TypeError:
+            return torch.optim.AdamW(
+                params,
+                lr=config.learning_rate,
+                weight_decay=config.weight_decay,
+            )
+
+    def _sample_responses(self, prompt: str, group_size: int = 4,
+                          no_grad_log_probs: bool = True,
+                          ) -> Tuple[List[str], List[torch.Tensor]]:
         inputs = self.tokenizer(
             prompt, return_tensors="pt"
         ).to(self.model.device)
         prompt_len = inputs["input_ids"].shape[1]
 
+        expanded = {k: v.expand(group_size, -1) for k, v in inputs.items()}
+
+        was_training = self.model.training
+        self.model.eval()
+
+        with torch.no_grad():
+            generated = self.model.generate(
+                **expanded,
+                max_new_tokens=self.config.max_new_tokens,
+                do_sample=True,
+                temperature=0.8,
+                top_p=0.9,
+                pad_token_id=self.tokenizer.pad_token_id,
+                eos_token_id=self.tokenizer.eos_token_id,
+            )
+
+        if was_training:
+            self.model.train()
+
+        generated_cpu = generated.cpu()
+        del generated
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
         responses = []
-        old_log_probs_list = []
+        log_probs_list = []
+        response_lens = []
 
-        for _ in range(group_size):
-            with torch.no_grad():
-                generated = self.model.generate(
-                    **inputs,
-                    max_new_tokens=self.config.max_new_tokens,
-                    do_sample=True,
-                    temperature=0.8,
-                    top_p=0.9,
-                    pad_token_id=self.tokenizer.pad_token_id,
-                    eos_token_id=self.tokenizer.eos_token_id,
-                )
-
-            response_ids = generated[0, prompt_len:]
+        for i in range(group_size):
+            response_ids = generated_cpu[i, prompt_len:]
             response_len = len(response_ids)
             response = self.tokenizer.decode(response_ids, skip_special_tokens=True).strip()
             responses.append(response)
+            response_lens.append(response_len)
 
-            if response_len > 0:
-                with torch.no_grad():
-                    outputs = self.model(input_ids=generated)
-                    logits = outputs.logits[0]
-                    resp_logits = logits[prompt_len - 1: prompt_len - 1 + response_len]
-                    log_probs = F.log_softmax(resp_logits, dim=-1)
-                    token_log_probs = log_probs.gather(
-                        -1, response_ids.unsqueeze(-1)
-                    ).squeeze(-1)
-                    old_log_probs_list.append(token_log_probs)
-            else:
-                old_log_probs_list.append(torch.tensor([], device=self.model.device))
+        valid_indices = [i for i, rl in enumerate(response_lens) if rl > 0]
 
-        return responses, old_log_probs_list
+        if valid_indices:
+            max_resp_len = max(response_lens[i] for i in valid_indices)
+            max_seq_len = prompt_len + max_resp_len
+            padded = torch.full(
+                (len(valid_indices), max_seq_len),
+                self.tokenizer.pad_token_id or 0,
+                dtype=torch.long,
+            )
+            attn_mask = torch.zeros(len(valid_indices), max_seq_len, dtype=torch.long)
+
+            for batch_idx, i in enumerate(valid_indices):
+                seq = generated_cpu[i, :prompt_len + response_lens[i]]
+                padded[batch_idx, :len(seq)] = seq
+                attn_mask[batch_idx, :len(seq)] = 1
+
+            ctx = torch.no_grad() if no_grad_log_probs else torch.enable_grad()
+            with ctx, torch.autocast(
+                device_type="cuda", dtype=torch.bfloat16,
+                enabled=self.model.device.type == "cuda"
+            ):
+                batch_outputs = self.model(input_ids=padded.to(self.model.device),
+                                           attention_mask=attn_mask.to(self.model.device))
+                batch_logits = batch_outputs.logits
+
+            for batch_idx, i in enumerate(valid_indices):
+                rl = response_lens[i]
+                resp_logits = batch_logits[batch_idx, prompt_len - 1: prompt_len - 1 + rl]
+                log_probs = F.log_softmax(resp_logits, dim=-1)
+                response_ids_tensor = generated_cpu[i, prompt_len: prompt_len + rl].to(self.model.device)
+                token_log_probs = log_probs.gather(
+                    -1, response_ids_tensor.unsqueeze(-1)
+                ).squeeze(-1)
+                if no_grad_log_probs:
+                    token_log_probs = token_log_probs.detach()
+                log_probs_list.append((i, token_log_probs))
+
+            del padded, attn_mask, batch_outputs, batch_logits
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        result_log_probs = [torch.tensor([], device=self.model.device)] * group_size
+        for i, lp in log_probs_list:
+            result_log_probs[i] = lp
+
+        return responses, result_log_probs
+
+    def _batch_compute_log_probs(self, prompt: str, responses: List[str]) -> List[torch.Tensor]:
+        """批量计算多个response的log_probs（带梯度），单次前向传播"""
+        prompt_ids = self.tokenizer(prompt, add_special_tokens=True)["input_ids"]
+        prompt_len = len(prompt_ids)
+
+        all_seq_ids = []
+        all_resp_lens = []
+        for resp in responses:
+            resp_ids = self.tokenizer(resp, add_special_tokens=False)["input_ids"]
+            full_ids = prompt_ids + resp_ids
+            if len(full_ids) > self.config.max_length:
+                full_ids = full_ids[:self.config.max_length]
+                resp_ids = full_ids[prompt_len:]
+            all_seq_ids.append(full_ids)
+            all_resp_lens.append(len(resp_ids))
+
+        max_seq_len = max(len(s) for s in all_seq_ids)
+        batch_size = len(all_seq_ids)
+        padded = torch.full((batch_size, max_seq_len), self.tokenizer.pad_token_id or 0, dtype=torch.long)
+        attn_mask = torch.zeros(batch_size, max_seq_len, dtype=torch.long)
+
+        for i, seq in enumerate(all_seq_ids):
+            padded[i, :len(seq)] = torch.tensor(seq, dtype=torch.long)
+            attn_mask[i, :len(seq)] = 1
+
+        with torch.enable_grad(), torch.autocast(
+            device_type="cuda", dtype=torch.bfloat16,
+            enabled=self.model.device.type == "cuda"
+        ):
+            outputs = self.model(input_ids=padded.to(self.model.device),
+                                 attention_mask=attn_mask.to(self.model.device))
+            batch_logits = outputs.logits
+
+        result = []
+        for i in range(batch_size):
+            rl = all_resp_lens[i]
+            if rl == 0:
+                result.append(torch.tensor([], device=self.model.device))
+                continue
+            resp_logits = batch_logits[i, prompt_len - 1: prompt_len - 1 + rl]
+            log_probs = F.log_softmax(resp_logits, dim=-1)
+            resp_ids_tensor = torch.tensor(all_seq_ids[i][prompt_len: prompt_len + rl],
+                                           device=self.model.device)
+            token_log_probs = log_probs.gather(-1, resp_ids_tensor.unsqueeze(-1)).squeeze(-1)
+            result.append(token_log_probs)
+
+        del padded, attn_mask, batch_logits, outputs
+        return result
+
+    def _save_checkpoint(self, global_step, epoch, step_in_epoch, optimizer_step):
+        ckpt_path = os.path.join(self.output_dir, f"checkpoint-{global_step}")
+        self.model.save_pretrained(ckpt_path)
+        self.tokenizer.save_pretrained(ckpt_path)
+        torch.save({
+            "global_step": global_step,
+            "epoch": epoch,
+            "step_in_epoch": step_in_epoch,
+            "optimizer_step": optimizer_step,
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "scheduler_state_dict": self.scheduler.state_dict() if self.scheduler else None,
+        }, os.path.join(ckpt_path, "training_state.pt"))
+        print(f"  已保存: {ckpt_path}")
+
+    def _load_checkpoint(self):
+        if not os.path.exists(self.output_dir):
+            return 0, 0, 0, 0
+        checkpoints = [f for f in os.listdir(self.output_dir) if f.startswith("checkpoint-")]
+        if not checkpoints:
+            return 0, 0, 0, 0
+        latest = sorted(checkpoints, key=lambda x: int(x.split("-")[1]))[-1]
+        ckpt_path = os.path.join(self.output_dir, latest)
+        state_path = os.path.join(ckpt_path, "training_state.pt")
+        if not os.path.exists(state_path):
+            return 0, 0, 0, 0
+        state = torch.load(state_path, map_location="cpu", weights_only=False)
+        self.optimizer.load_state_dict(state["optimizer_state_dict"])
+        if self.scheduler and state.get("scheduler_state_dict"):
+            self.scheduler.load_state_dict(state["scheduler_state_dict"])
+        optimizer_step = state.get("optimizer_step", 0)
+        print(f"  从 checkpoint 恢复: {ckpt_path} (global_step={state['global_step']}, optimizer_step={optimizer_step})")
+        return state["global_step"], state["epoch"], state["step_in_epoch"], optimizer_step
 
     def train(self, train_dataset: GRPODataset, num_epochs: int = 3,
-              group_size: int = 4, max_steps_per_epoch: int = 200,
+              group_size: int = 4, max_steps_per_epoch: int = 500,
               gradient_accumulation_steps: int = 2, save_steps: int = 50,
-              max_samples: int = None):
+              max_samples: int = None, dataloader_num_workers: int = 4,
+              seed: int = 42):
         total_steps = num_epochs * max_steps_per_epoch
+        total_optimizer_steps = total_steps // gradient_accumulation_steps
         print(f"开始GRPO训练: {num_epochs}轮, 每轮最多{max_steps_per_epoch}步, group_size={group_size}")
-        print(f"  梯度累积: {gradient_accumulation_steps}, 总步数上限: {total_steps}")
+        print(f"  梯度累积: {gradient_accumulation_steps}, 总步数上限: {total_steps}, optimizer步数: {total_optimizer_steps}")
 
-        dataloader = DataLoader(train_dataset, batch_size=1, shuffle=True, num_workers=0)
+        # 固定 shuffle 种子，确保断点续训时数据顺序可复现
+        generator = torch.Generator()
+        generator.manual_seed(seed)
+        dataloader = DataLoader(train_dataset, batch_size=1, shuffle=True, 
+                               num_workers=dataloader_num_workers, generator=generator)
         global_step = 0
+        optimizer_step = 0
         progress_bar = tqdm(total=total_steps, desc="GRPO训练")
 
-        for epoch in range(num_epochs):
+        warmup_steps = int(total_optimizer_steps * self.config.warmup_ratio)
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer, T_max=total_optimizer_steps - warmup_steps, eta_min=1e-7
+        )
+
+        resume_global_step, resume_epoch, resume_step_in_epoch, resume_opt_step = self._load_checkpoint()
+        if resume_global_step > 0:
+            global_step = resume_global_step
+            optimizer_step = resume_opt_step
+            progress_bar.update(global_step)
+
+        start_epoch = resume_epoch if resume_global_step > 0 else 0
+
+        for epoch in range(start_epoch, num_epochs):
             self.model.train()
             epoch_metrics = {"reward": [], "loss": [], "kl": []}
-            step_in_epoch = 0
+            step_in_epoch = resume_step_in_epoch if epoch == start_epoch and resume_global_step > 0 else 0
 
-            for batch in dataloader:
+            for batch_idx, batch in enumerate(dataloader):
+                if batch_idx < step_in_epoch:
+                    continue
                 if step_in_epoch >= max_steps_per_epoch:
                     break
                 if max_samples and step_in_epoch >= max_samples:
@@ -297,59 +448,69 @@ class GRPOTrainer:
                 prompt = batch["prompt"][0]
                 answer = batch["answer"][0]
 
-                responses, old_log_probs_list = self._sample_with_log_probs(
-                    prompt, group_size=group_size
+                responses, old_log_probs_list = self._sample_responses(
+                    prompt, group_size=group_size, no_grad_log_probs=True
                 )
 
                 rewards = [compute_reward(resp, answer) for resp in responses]
                 advantages = compute_group_relative_advantages(rewards)
 
-                self.optimizer.zero_grad()
                 group_loss = 0.0
                 group_kl = 0.0
                 active_samples = 0
 
-                for response, old_log_probs, advantage in zip(
-                    responses, old_log_probs_list, advantages
+                active_items = []
+                for idx, (response, old_log_probs, advantage) in enumerate(
+                    zip(responses, old_log_probs_list, advantages)
                 ):
                     if abs(advantage) < 1e-6 or len(old_log_probs) == 0:
                         continue
+                    active_items.append((response, old_log_probs, advantage))
 
-                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16,
-                                        enabled=self.model.device.type == "cuda"):
-                        current_log_probs, _ = compute_response_log_probs(
-                            self.model, self.tokenizer, prompt, response,
-                            max_length=self.config.max_length,
-                            no_grad=False,
+                if active_items:
+                    all_current_log_probs = self._batch_compute_log_probs(
+                        prompt, [r for r, _, _ in active_items]
+                    )
+
+                    for (response, old_log_probs, advantage), current_log_probs in zip(
+                        active_items, all_current_log_probs
+                    ):
+                        min_len = min(len(current_log_probs), len(old_log_probs))
+                        if min_len == 0:
+                            continue
+
+                        current_log_probs = current_log_probs[:min_len]
+                        old_log_probs = old_log_probs[:min_len]
+                        adv_tensor = torch.tensor(
+                            advantage, device=self.model.device, dtype=torch.float32
                         )
 
-                    min_len = min(len(current_log_probs), len(old_log_probs))
-                    if min_len == 0:
-                        continue
+                        loss, kl = compute_grpo_loss(
+                            current_log_probs, old_log_probs, adv_tensor,
+                            epsilon=self.config.epsilon,
+                            kl_coef=self.config.kl_coef,
+                        )
 
-                    current_log_probs = current_log_probs[:min_len]
-                    old_log_probs = old_log_probs[:min_len].detach()
-                    adv_tensor = torch.tensor(
-                        advantage, device=self.model.device, dtype=torch.float32
-                    )
-
-                    loss, kl = compute_grpo_loss(
-                        current_log_probs, old_log_probs, adv_tensor,
-                        epsilon=self.config.epsilon,
-                        kl_coef=self.config.kl_coef,
-                    )
-
-                    loss = loss / (group_size * gradient_accumulation_steps)
-                    loss.backward()
-                    group_loss += loss.item() * group_size * gradient_accumulation_steps
-                    group_kl += kl
-                    active_samples += 1
+                        loss = loss / (group_size * gradient_accumulation_steps)
+                        loss.backward()
+                        group_loss += loss.item() * group_size * gradient_accumulation_steps
+                        group_kl += kl
+                        active_samples += 1
 
                 if active_samples > 0 and (step_in_epoch + 1) % gradient_accumulation_steps == 0:
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                    trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+                    torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
                     self.optimizer.step()
+                    optimizer_step += 1
+                    if optimizer_step >= warmup_steps:
+                        self.scheduler.step()
+                    elif optimizer_step > 0:
+                        warmup_lr = self.config.learning_rate * optimizer_step / max(warmup_steps, 1)
+                        for pg in self.optimizer.param_groups:
+                            pg['lr'] = warmup_lr
                     self.optimizer.zero_grad()
 
+                if active_samples > 0:
                     epoch_metrics["loss"].append(group_loss / active_samples)
                     epoch_metrics["kl"].append(group_kl / active_samples)
 
@@ -358,19 +519,19 @@ class GRPOTrainer:
                 step_in_epoch += 1
                 progress_bar.update(1)
 
-                if torch.cuda.is_available():
+                if global_step % 500 == 0 and torch.cuda.is_available():
                     torch.cuda.empty_cache()
 
                 if global_step % save_steps == 0 and global_step > 0:
-                    ckpt_path = os.path.join(self.output_dir, f"checkpoint-{global_step}")
-                    self.model.save_pretrained(ckpt_path)
-                    self.tokenizer.save_pretrained(ckpt_path)
-                    print(f"  已保存: {ckpt_path}")
+                    self._save_checkpoint(global_step, epoch, step_in_epoch, optimizer_step)
 
             avg_reward = sum(epoch_metrics["reward"]) / max(len(epoch_metrics["reward"]), 1)
             avg_loss = sum(epoch_metrics["loss"]) / max(len(epoch_metrics["loss"]), 1)
             avg_kl = sum(epoch_metrics["kl"]) / max(len(epoch_metrics["kl"]), 1)
             print(f"  Epoch {epoch+1}/{num_epochs}: reward={avg_reward:.3f}, loss={avg_loss:.4f}, kl={avg_kl:.4f}, steps={step_in_epoch}")
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         final_path = os.path.join(self.output_dir, "final")
         self.model.save_pretrained(final_path)
@@ -385,15 +546,33 @@ def train_grpo(
     grpo_data_path: str,
     output_dir: str,
     device: str = None,
-    group_size: int = 4,
+    group_size: int = 8,
     num_iterations: int = 3,
-    learning_rate: float = 1e-6,
+    learning_rate: float = 5e-6,
     max_new_tokens: int = None,
+    max_length: int = 512,
     max_samples: int = None,
+    max_steps_per_epoch: int = 1000,
+    gradient_accumulation_steps: int = 2,
+    save_steps: int = 50,
+    dataloader_num_workers: int = 4,
+    lora_r: int = 8,
+    lora_alpha: int = 16,
+    lora_dropout: float = 0.05,
+    weight_decay: float = 0.01,
+    optim: str = "adamw_torch_fused",
+    seed: int = 42,
 ):
     if device is None:
         device = get_device()
     print(f"设备: {device}")
+
+    # 解析路径，确保路径一致性
+    sft_model_path = _resolve_relative_path(sft_model_path)
+    if sft_peft_path:
+        sft_peft_path = _resolve_relative_path(sft_peft_path)
+    grpo_data_path = _resolve_relative_path(grpo_data_path)
+    output_dir = _resolve_relative_path(output_dir)
 
     actual_data_path = grpo_data_path
     if not os.path.exists(actual_data_path):
@@ -413,16 +592,21 @@ def train_grpo(
 
     print("加载模型...")
     tokenizer = AutoTokenizer.from_pretrained(
-        sft_model_path, use_fast=False, trust_remote_code=True
+        sft_model_path, use_fast=True, trust_remote_code=True
     )
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    # 提前缓存 attn_impl，避免重复调用
+    attn_impl = _get_attn_impl() if device != "cpu" else None
+    attn_kwargs = {"attn_implementation": attn_impl} if attn_impl else {}
+
     base_model = AutoModelForCausalLM.from_pretrained(
         sft_model_path,
-        device_map=device if device != "cpu" else None,
+        device_map={"": device} if device != "cpu" else None,
         torch_dtype=torch.bfloat16 if device != "cpu" else torch.float32,
         trust_remote_code=True,
+        **attn_kwargs,
     )
 
     if sft_peft_path and os.path.exists(sft_peft_path):
@@ -432,13 +616,20 @@ def train_grpo(
             print(f"已加载PEFT权重: {sft_peft_path}")
             model = model.merge_and_unload()
             del base_model
+            import gc; gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         else:
             del base_model
+            import gc; gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             model = AutoModelForCausalLM.from_pretrained(
                 sft_peft_path,
-                device_map=device if device != "cpu" else None,
+                device_map={"": device} if device != "cpu" else None,
                 torch_dtype=torch.bfloat16 if device != "cpu" else torch.float32,
                 trust_remote_code=True,
+                **attn_kwargs,
             )
             print(f"已加载完整模型: {sft_peft_path}")
     else:
@@ -449,30 +640,36 @@ def train_grpo(
 
     model.enable_input_require_grads()
 
-    if hasattr(model, "gradient_checkpointing_enable"):
-        model.gradient_checkpointing_enable()
-        print("已启用梯度检查点")
-
     from peft import LoraConfig, TaskType, get_peft_model
     lora_config = LoraConfig(
         task_type=TaskType.CAUSAL_LM,
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
                         "gate_proj", "up_proj", "down_proj"],
         inference_mode=False,
-        r=8,
-        lora_alpha=16,
-        lora_dropout=0.05,
+        r=lora_r,
+        lora_alpha=lora_alpha,
+        lora_dropout=lora_dropout,
     )
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
 
+    if hasattr(model, "gradient_checkpointing_enable"):
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
+        print("已启用梯度检查点(use_reentrant=False)")
+
     print("准备GRPO数据集...")
-    dataset = GRPODataset(actual_data_path, tokenizer)
+    dataset = GRPODataset(actual_data_path, tokenizer, max_length=max_length)
 
     config = GRPOConfig()
     config.group_size = group_size
     config.num_epochs = num_iterations
     config.learning_rate = learning_rate
+    config.max_steps_per_epoch = max_steps_per_epoch
+    config.gradient_accumulation_steps = gradient_accumulation_steps
+    config.max_length = max_length
+    config.weight_decay = weight_decay
     if max_new_tokens is not None:
         config.max_new_tokens = max_new_tokens
 
@@ -481,9 +678,12 @@ def train_grpo(
         train_dataset=dataset,
         num_epochs=num_iterations,
         group_size=group_size,
-        max_steps_per_epoch=config.max_steps_per_epoch,
-        gradient_accumulation_steps=config.gradient_accumulation_steps,
+        max_steps_per_epoch=max_steps_per_epoch,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        save_steps=save_steps,
         max_samples=max_samples,
+        dataloader_num_workers=dataloader_num_workers,
+        seed=seed,
     )
 
     return trainer
@@ -495,6 +695,7 @@ def run_grpo_from_notebook(
     grpo_data_path: str,
     output_dir: str,
     device: str = "cuda",
+    **kwargs,
 ):
     os.makedirs(output_dir, exist_ok=True)
     return train_grpo(
@@ -503,9 +704,7 @@ def run_grpo_from_notebook(
         grpo_data_path=grpo_data_path,
         output_dir=output_dir,
         device=device,
-        group_size=4,
-        num_iterations=3,
-        learning_rate=1e-6,
+        **kwargs,
     )
 
 
@@ -517,7 +716,7 @@ if __name__ == "__main__":
     parser.add_argument("--grpo_data_path", type=str, default="../data/train_cot.json")
     parser.add_argument("--output_dir", type=str, default="../outputs/scheme4_grpo")
     parser.add_argument("--device", type=str, default=None)
-    parser.add_argument("--group_size", type=int, default=4)
+    parser.add_argument("--group_size", type=int, default=8)
     parser.add_argument("--num_iterations", type=int, default=3)
     args = parser.parse_args()
 

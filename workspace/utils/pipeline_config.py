@@ -16,7 +16,7 @@ import json
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from utils.common import get_device as _get_device
+from utils.common import get_device as _get_device, enable_tf32 as _enable_tf32, set_seed as _set_seed
 
 
 def get_device() -> str:
@@ -82,7 +82,8 @@ def _ensure_sft_data_from_preference(pref_path: str) -> str:
     sft_path = pref_path.replace('train_preference_final_merged.json', 'train_cot.json').replace('train_preference.json', 'train_cot.json')
 
     if os.path.exists(sft_path):
-        existing = json.load(open(sft_path, 'r', encoding='utf-8'))
+        with open(sft_path, 'r', encoding='utf-8') as f:
+            existing = json.load(f)
         if len(existing) > 0 and existing[0].get('cot'):
             return sft_path
 
@@ -90,7 +91,8 @@ def _ensure_sft_data_from_preference(pref_path: str) -> str:
         return sft_path
 
     print(f"从偏好数据派生SFT数据: {pref_path} → {sft_path}")
-    pref_data = json.load(open(pref_path, 'r', encoding='utf-8'))
+    with open(pref_path, 'r', encoding='utf-8') as f:
+        pref_data = json.load(f)
 
     sft_data = []
     for item in pref_data:
@@ -108,7 +110,8 @@ def _ensure_sft_data_from_preference(pref_path: str) -> str:
         })
 
     os.makedirs(os.path.dirname(sft_path) or '.', exist_ok=True)
-    json.dump(sft_data, open(sft_path, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
+    with open(sft_path, 'w', encoding='utf-8') as f:
+        json.dump(sft_data, f, ensure_ascii=False, indent=2)
     print(f"SFT数据已生成: {len(sft_data)} 条 → {sft_path}")
 
     return sft_path
@@ -176,14 +179,19 @@ def get_sft_config(device: str = None, paths: dict = None) -> dict:
         'lr_scheduler_type': 'cosine',
         'save_steps': 500,
         'logging_steps': 10,
+        'seed': 42,
     }
 
     if is_gpu:
+        _enable_tf32()
+        _set_seed(42)
         config.update({
             'max_length': 512,
-            'batch_size': 4,
-            'gradient_accumulation_steps': 4,
+            'batch_size': 32,
+            'gradient_accumulation_steps': 2,
             'num_epochs': 3,
+            'dataloader_num_workers': 4,
+            'optim': 'adamw_torch_fused',
         })
     else:
         config.update({
@@ -212,16 +220,24 @@ def get_dpo_config(device: str = None, paths: dict = None) -> dict:
         'pref_data_path': paths['train_preference'],
         'output_dir': os.path.join(paths['output_dir'], 'scheme3_dpo'),
         'device': device,
-        'learning_rate': 5e-7,
+        'learning_rate': 5e-5,
         'beta': 0.1,
+        'weight_decay': 0.01,
         'max_length': 512 if is_gpu else 256,
+        'dataloader_num_workers': 4 if is_gpu else 0,
+        'lora_r': 8,
+        'lora_alpha': 16,
+        'lora_dropout': 0.05,
+        'save_steps': 500,
+        'seed': 42,
     }
 
     if is_gpu:
         config.update({
-            'batch_size': 2,
-            'gradient_accumulation_steps': 8,
+            'batch_size': 8,
+            'gradient_accumulation_steps': 2,
             'num_epochs': 3,
+            'optim': 'adamw_torch_fused',
         })
     else:
         config.update({
@@ -257,21 +273,31 @@ def get_grpo_config(device: str = None, paths: dict = None) -> dict:
         'grpo_data_path': paths['train_cot'],
         'output_dir': os.path.join(paths['output_dir'], 'scheme4_grpo'),
         'device': device,
-        'learning_rate': 1e-6,
+        'learning_rate': 5e-6,
+        'weight_decay': 0.01,
+        'max_length': 512 if is_gpu else 256,
+        'max_steps_per_epoch': 500 if is_gpu else 10,
+        'gradient_accumulation_steps': 2,
+        'save_steps': 50,
+        'dataloader_num_workers': 4 if is_gpu else 0,
+        'lora_r': 8,
+        'lora_alpha': 16,
+        'lora_dropout': 0.05,
+        'seed': 42,
     }
 
     if is_gpu:
         config.update({
-            'group_size': 4,
+            'group_size': 8,
             'num_iterations': 3,
-            'max_new_tokens': 128,
+            'max_new_tokens': 256,
+            'optim': 'adamw_torch_fused',
         })
     else:
         config.update({
             'group_size': 2,
             'num_iterations': 1,
             'max_new_tokens': 64,
-            'max_samples': 3,
         })
 
     return config

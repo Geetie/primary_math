@@ -9,7 +9,7 @@ import sys
 # 添加项目根目录到路径
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from utils.common import check_model_downloaded
+from utils.common import check_model_downloaded, ensure_flash_attn
 
 
 def download_model_qwen(cache_dir: str = "./models/Qwen2.5-0.5B-Instruct") -> str:
@@ -45,6 +45,10 @@ def download_model_qwen(cache_dir: str = "./models/Qwen2.5-0.5B-Instruct") -> st
             raise
 
 
+def _get_attn_impl():
+    return ensure_flash_attn()
+
+
 def load_model_and_tokenizer(model_path: str, use_peft: bool = False, peft_path: str = None, device: str = None):
     """
     加载模型和tokenizer
@@ -60,30 +64,38 @@ def load_model_and_tokenizer(model_path: str, use_peft: bool = False, peft_path:
     """
     import torch
     from transformers import AutoTokenizer, AutoModelForCausalLM
-    
+
     if device is None:
         if torch.cuda.is_available():
             device = "cuda"
         else:
             device = "cpu"
-    
+
     print(f"使用设备: {device}")
-    
-    # 加载tokenizer
+
+    attn_impl = _get_attn_impl()
+    if attn_impl:
+        print(f"使用注意力实现: {attn_impl}")
+
     tokenizer = AutoTokenizer.from_pretrained(
         model_path,
-        use_fast=False,
+        use_fast=True,
         trust_remote_code=True
     )
-    
-    # 加载模型
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path,
-        device_map=device if device != "cpu" else None,
-        torch_dtype=torch.bfloat16 if device != "cpu" else torch.float32,
-        trust_remote_code=True
-    )
-    
+
+    model_kwargs = {
+        "trust_remote_code": True,
+    }
+    if device != "cpu":
+        model_kwargs["device_map"] = {"": device}
+        model_kwargs["torch_dtype"] = torch.bfloat16
+        if attn_impl:
+            model_kwargs["attn_implementation"] = attn_impl
+    else:
+        model_kwargs["torch_dtype"] = torch.float32
+
+    model = AutoModelForCausalLM.from_pretrained(model_path, **model_kwargs)
+
     if device == "cpu":
         model = model.to(device)
     

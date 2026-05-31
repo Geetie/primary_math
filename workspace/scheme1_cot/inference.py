@@ -15,8 +15,12 @@ import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from peft import PeftModel
 
-from utils.common import load_json, save_csv, extract_number, get_device, check_model_downloaded
+from utils.common import load_json, save_csv, extract_number, get_device, check_model_downloaded, ensure_flash_attn
 from scheme1_cot.cot_prompts import create_messages_with_cot
+
+
+def _get_attn_impl():
+    return ensure_flash_attn()
 
 
 # ============================================================
@@ -30,14 +34,21 @@ def load_model(model_path: str, peft_path: str = None, device: str = None):
     print(f"设备: {device}")
 
     tokenizer = AutoTokenizer.from_pretrained(
-        model_path, use_fast=False, trust_remote_code=True
+        model_path, use_fast=True, trust_remote_code=True
     )
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path,
-        device_map=device if device != "cpu" else None,
-        torch_dtype=torch.bfloat16 if device != "cpu" else torch.float32,
-        trust_remote_code=True,
-    )
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    model_kwargs = {"trust_remote_code": True}
+    if device != "cpu":
+        model_kwargs["device_map"] = {"": device}
+        model_kwargs["torch_dtype"] = torch.bfloat16
+        attn_impl = _get_attn_impl()
+        if attn_impl:
+            model_kwargs["attn_implementation"] = attn_impl
+    else:
+        model_kwargs["torch_dtype"] = torch.float32
+
+    model = AutoModelForCausalLM.from_pretrained(model_path, **model_kwargs)
     if device == "cpu":
         model = model.to(device)
 
@@ -50,9 +61,10 @@ def load_model(model_path: str, peft_path: str = None, device: str = None):
             del model
             model = AutoModelForCausalLM.from_pretrained(
                 peft_path,
-                device_map=device if device != "cpu" else None,
+                device_map={"": device} if device != "cpu" else None,
                 torch_dtype=torch.bfloat16 if device != "cpu" else torch.float32,
                 trust_remote_code=True,
+                **({"attn_implementation": attn_impl} if (attn_impl := _get_attn_impl()) and device != "cpu" else {}),
             )
             if device == "cpu":
                 model = model.to(device)

@@ -7,6 +7,11 @@
 3. ✅ 学习率 2e-4（0.5B 最优值）
 4. ✅ 使用 Qwen 官方对话模板
 5. ✅ 数据由 LongCat API 生成（不再用硬编码模板）
+6. ✅ 双重答案风险修复：更健壮的 assistant_content 拼接逻辑
+7. ✅ 相对路径风险修复：_resolve_relative_path 确保路径解析一致
+8. ✅ 默认配置优化：dataloader_num_workers=4, optim=adamw_torch_fused
+9. ✅ 断点检测简化：让 Trainer 自动查找最新 checkpoint
+10. ✅ 显式配置：eval_strategy="no" 和 remove_unused_columns 注释
 """
 
 import os
@@ -26,7 +31,11 @@ from transformers import (
 )
 from peft import LoraConfig, TaskType, get_peft_model
 
-from utils.common import load_json, save_json, print_config, get_device
+from utils.common import load_json, save_json, print_config, get_device, ensure_flash_attn, enable_tf32, set_seed
+
+
+def _get_attn_impl():
+    return ensure_flash_attn()
 
 
 # ============================================================
@@ -42,6 +51,25 @@ QWEN_LORA_TARGET_MODULES = [
 # ============================================================
 # 数据处理：使用 Qwen 官方对话模板 + Label Masking
 # ============================================================
+
+def _build_assistant_content(cot: str, answer: str) -> str:
+    """
+    构建 assistant 回复内容，仅在 COT 未包含答案时才追加。
+    
+    避免双重答案风险：
+    - 若 COT 已有「答案：」格式，直接返回
+    - 否则检查 COT 末尾是否已有相同数字
+    - 仅在都不满足时才追加「答案：{answer}」
+    """
+    if re.search(r'答案[：:]', cot):
+        return cot
+    # 检查 COT 末尾是否已有相同数字
+    nums_in_cot = re.findall(r'\d+(?:\.\d+)?', cot)
+    expected = str(answer).strip()
+    if nums_in_cot and nums_in_cot[-1] == expected:
+        return cot
+    return f"{cot}\n答案：{answer}"
+
 
 def process_sft_sample(tokenizer, example: Dict, max_length: int = 512) -> Dict:
     """
@@ -68,7 +96,7 @@ def process_sft_sample(tokenizer, example: Dict, max_length: int = 512) -> Dict:
     if isinstance(instruction, list):
         instruction = "".join(instruction)
 
-    assistant_content = f"{cot}\n答案：{answer}" if not re.search(r'答案[：:]', cot) else cot
+    assistant_content = _build_assistant_content(cot, answer)
 
     messages = [
         {"role": "system", "content": f"{instruction} 请按步骤解答，最后用\"答案：数字\"给出结果。"},
@@ -107,14 +135,14 @@ class COTTrainer:
     DEFAULT_CONFIG = {
         "model_name": "Qwen/Qwen2.5-0.5B-Instruct",
         "model_cache_dir": "../models/Qwen2.5-0.5B-Instruct",
-        "train_data_path": "../data/train_cot_original.json",
+        "train_data_path": "../data/train_cot.json",
         "output_dir": "../outputs/scheme2_cot",
         "max_length": 512,
         "lora_r": 8,
         "lora_alpha": 16,
         "lora_dropout": 0.05,
-        "batch_size": 4,
-        "gradient_accumulation_steps": 4,
+        "batch_size": 8,
+        "gradient_accumulation_steps": 2,
         "num_epochs": 3,
         "learning_rate": 2e-4,
         "warmup_ratio": 0.1,
@@ -123,7 +151,17 @@ class COTTrainer:
         "logging_steps": 10,
         "lr_scheduler_type": "cosine",
         "max_steps": -1,
+        "dataloader_num_workers": 4,
+        "optim": "adamw_torch_fused",
+        "seed": 42,
     }
+
+    def _resolve_relative_path(self, path: str) -> str:
+        """将相对路径解析为绝对路径（相对于脚本目录）"""
+        if os.path.isabs(path):
+            return path
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        return os.path.normpath(os.path.join(script_dir, path))
 
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         self.config = {**self.DEFAULT_CONFIG, **(config or {})}
@@ -144,20 +182,25 @@ class COTTrainer:
         self.device = device
         print(f"设备: {device}")
 
-        model_path = self.config["model_cache_dir"]
+        model_path = self._resolve_relative_path(self.config["model_cache_dir"])
 
         self.tokenizer = AutoTokenizer.from_pretrained(
-            model_path, use_fast=False, trust_remote_code=True
+            model_path, use_fast=True, trust_remote_code=True
         )
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_path,
-            device_map=device if device != "cpu" else None,
-            torch_dtype=torch.bfloat16 if device != "cpu" else torch.float32,
-            trust_remote_code=True,
-        )
+        model_kwargs = {"trust_remote_code": True}
+        if device != "cpu":
+            model_kwargs["device_map"] = {"": device}
+            model_kwargs["torch_dtype"] = torch.bfloat16
+            attn_impl = _get_attn_impl()
+            if attn_impl:
+                model_kwargs["attn_implementation"] = attn_impl
+        else:
+            model_kwargs["torch_dtype"] = torch.float32
+
+        self.model = AutoModelForCausalLM.from_pretrained(model_path, **model_kwargs)
         if device == "cpu":
             self.model = self.model.to(device)
 
@@ -170,7 +213,7 @@ class COTTrainer:
     def prepare_data(self) -> List[Dict]:
         """加载 COT 数据并预处理"""
         print("加载 COT 训练数据...")
-        data_path = self.config["train_data_path"]
+        data_path = self._resolve_relative_path(self.config["train_data_path"])
         if not os.path.exists(data_path):
             fallback = data_path.replace("train_cot.json", "train_cot_original.json")
             if os.path.exists(fallback):
@@ -209,16 +252,7 @@ class COTTrainer:
     # ----------------------------------------------------------
     def create_trainer(self, train_dataset: List[Dict]):
         """创建 HuggingFace Trainer"""
-        output_dir = self.config["output_dir"]
-
-        # 检查断点
-        has_checkpoint = False
-        if os.path.exists(output_dir):
-            has_checkpoint = any(
-                f.startswith("checkpoint-")
-                for f in os.listdir(output_dir)
-                if os.path.isdir(os.path.join(output_dir, f))
-            )
+        output_dir = self._resolve_relative_path(self.config["output_dir"])
 
         training_args = TrainingArguments(
             output_dir=output_dir,
@@ -234,11 +268,19 @@ class COTTrainer:
             lr_scheduler_type=self.config["lr_scheduler_type"],
             save_on_each_node=True,
             gradient_checkpointing=True,
+            gradient_checkpointing_kwargs={"use_reentrant": False},
             report_to="none",
+            # 保留原始数据列，不自动删除模型不需要的字段
+            # 这里我们的预处理已经生成了完整的 input_ids/attention_mask/labels
             remove_unused_columns=False,
             fp16=False,
             bf16=self.device != "cpu",
-            dataloader_num_workers=2,
+            dataloader_num_workers=self.config.get("dataloader_num_workers", 4),
+            dataloader_pin_memory=self.device != "cpu",
+            optim=self.config.get("optim", "adamw_torch_fused"),
+            seed=self.config.get("seed", 42),
+            # 显式声明不进行评估
+            eval_strategy="no",
         )
 
         self.trainer = Trainer(
@@ -254,19 +296,10 @@ class COTTrainer:
     def train(self, resume: bool = True):
         """开始训练，支持断点续训"""
         print("开始训练...")
-        checkpoint = None
-        if resume:
-            output_dir = self.config["output_dir"]
-            if os.path.exists(output_dir):
-                checkpoints = [f for f in os.listdir(output_dir) if f.startswith("checkpoint-")]
-                if checkpoints:
-                    latest = sorted(checkpoints, key=lambda x: int(x.split("-")[1]))[-1]
-                    checkpoint = os.path.join(output_dir, latest)
-                    print(f"从 checkpoint 恢复: {checkpoint}")
+        # 使用 Trainer 自动查找最新 checkpoint，更健壮
+        self.trainer.train(resume_from_checkpoint=resume)
 
-        self.trainer.train(resume_from_checkpoint=checkpoint)
-
-        final_path = os.path.join(self.config["output_dir"], "final")
+        final_path = os.path.join(self._resolve_relative_path(self.config["output_dir"]), "final")
         self.trainer.save_model(final_path)
         print(f"模型已保存: {final_path}")
 
